@@ -1,0 +1,552 @@
+---
+title: "Reference projection: ProjecTILs atlases and ImmGen (SingleR)"
+output:
+  rmarkdown::html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 5
+vignette: >
+  %\VignetteIndexEntry{ben_legg_projections}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+  %\VignetteBuild{true}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+### 1. Workplace setup
+
+```{r setup, warning = FALSE, include = FALSE}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(ggrepel)
+library(patchwork)
+library(ggnewscale)
+library(scales)
+library(pheatmap)
+library(Seurat)
+library(ProjecTILs)
+library(SingleR)
+library(celldex)
+library(SummarizedExperiment)
+library(org.Mm.eg.db)
+library(DT)
+```
+
+#### 1.1 Directory structure
+
+```{r directory_setup, warning = FALSE}
+# 1. make sure the bioinf_scratch drive is mounted
+# 2. session -> set working directory -> scripts
+# 3. the two ProjecTILs atlases live in ~/resources/projectils/ (see 1.2)
+
+######## directory structure #######
+projectDir=paste0("../")
+resultsDir=paste0(projectDir,"/results")
+imageDir=paste0(resultsDir,"/figures/projections/")
+robjectsDir = paste(resultsDir,"/Robjects/",sep="")
+tableDir = paste(resultsDir,"/tables/",sep="")
+
+system(paste("mkdir -p",imageDir))
+system(paste("mkdir -p",robjectsDir))
+system(paste("mkdir -p",tableDir))
+
+refDir <- path.expand("~/resources/projectils/")
+```
+
+#### 1.2 Purpose and caveats
+
+Each bulk sample is treated as one "cell" and placed against two kinds of
+reference, following the PMC225 analysis:
+
+NC is excluded throughout: it is the DE reference, not a state of interest.
+
+1. **ProjecTILs atlases** (single-cell): the TIL atlas
+   (`ref_TILAtlas_mouse_v1`, exhaustion-centred CD8) and the acute-infection
+   CD8 atlas (`ref_CD8_LCMV_mouse_v2`, naive to effector to memory).
+2. **ImmGen** (bulk, sorted populations) via SingleR, curated to peripheral
+   T-cell states. ImmGen contains an *in vitro* activation timecourse
+   (`CTR, 1H, 5H, 24H, 48H, 96H`) which lines up with this 24-120h design.
+
+**Caveat, carried over from PMC225.** A bulk sample is a mixture, and a mixture
+projected onto a single-cell atlas lands at a centroid rather than in any one
+state. The ProjecTILs section is therefore exploratory. SingleR is bulk-to-bulk
+and its rank correlation is robust across platforms, so the ImmGen calls are
+the more defensible of the two. Neither reference contains cytokine-only
+stimulation without TCR engagement, so every call is a nearest resemblance,
+not ground truth.
+
+> Reference files, if missing:
+> `curl -L -o ref_TILAtlas_mouse_v1.rds https://ndownloader.figshare.com/files/41398167`
+> `curl -L -o ref_CD8_LCMV_mouse_v2.rds https://ndownloader.figshare.com/files/41703714`
+
+#### 1.3 Colours
+
+```{r colours}
+# same treatment colours as 6a.analysis.Rmd
+treatment_colours <- c(
+  "Naive" = "gray70", "NC" = "gray40",
+  "IL2" = "#F20D0D", "IL715" = "#00B050", "IL18" = "#FF8C00", "IL36b" = "#0096FF"
+)
+
+# state palette from the PMC225 projections: naive blue, effector orange/red,
+# exhausted dark red; anything unrecognised gets a hue
+state_palette <- function(states){
+  states <- as.character(unique(states))
+  base <- c(Naive="#3E5496", NaiveLike="#3E5496", EarlyActiv="#4DAF4A",
+            EffectorMemory="#FF7F00", CentralMemory="#F781BF", Effector="#E41A1C",
+            SLEC="#FF4D4D", MemoryPrecursor="#66C2A5", MP="#66C2A5",
+            Tpex="#984EA3", Tex="#B2182B", Th1="#1B9E77", Tfh="#E7298A", Treg="#D01556")
+  key <- sub("^CD[48]_", "", states)
+  col <- base[match(key, names(base))]
+  miss <- is.na(col); if(any(miss)) col[miss] <- hue_pal()(sum(miss))
+  setNames(as.character(col), states)
+}
+```
+
+### 2. Build the sample-level object
+
+```{r load_counts}
+# Counts from 6a's cache, restricted to the 71 samples 6a kept, using its own
+# metadata table so the exclusions cannot drift between the two documents.
+load(paste0(robjectsDir, "featurecounts_files.Rdata"))   # df: genes x all 76 samples
+
+meta <- read.csv(paste0(tableDir, "sample_metadata.csv"), stringsAsFactors = FALSE) %>%
+  mutate(treatment = factor(treatment, levels = names(treatment_colours)),
+         time      = factor(time, levels = c("0h","24h","48h","72h","96h","120h")))
+
+# NC is not projected. It is untreated culture - the right reference for DE,
+# but not a state of interest here, and it crowds the atlas plots. Dropping it
+# also drops the level, so it disappears from legends and facets.
+meta <- meta %>% dplyr::filter(treatment != "NC") %>% mutate(treatment = droplevels(treatment))
+
+missing <- setdiff(meta$sample_name, colnames(df))
+if(length(missing) > 0) stop("samples in metadata but not in counts: ", paste(missing, collapse=", "))
+df <- df[, meta$sample_name]
+
+# Ensembl -> symbol, collapsing duplicate symbols to the higher-count row.
+# Same as 6a section 2.3.
+egENSEMBL <- toTable(org.Mm.egENSEMBL)
+egSYMBOL  <- toTable(org.Mm.egSYMBOL)
+ids <- gsub("\\..*", "", row.names(df)); row.names(df) <- ids
+entrez <- egENSEMBL$gene_id[match(row.names(df), egENSEMBL$ensembl_id)]
+symbol <- egSYMBOL$symbol[match(entrez, egSYMBOL$gene_id)]
+o <- order(rowSums(df), decreasing = TRUE)
+df <- df[o, ]; symbol <- symbol[o]
+keep <- !is.na(symbol) & !duplicated(symbol)
+counts <- as.matrix(df[keep, ]); rownames(counts) <- symbol[keep]
+
+colnames(counts) <- meta$label
+rownames(meta)   <- meta$label
+
+cat("genes:", nrow(counts), " samples:", ncol(counts), "\n")
+```
+
+```{r seurat_object}
+# One Seurat "cell" per bulk sample. Log-normalisation only - no scaling or
+# variable-gene selection here, both references do their own.
+obj <- CreateSeuratObject(counts = counts, meta.data = meta)
+obj <- NormalizeData(obj, verbose = FALSE)
+obj
+```
+
+### 3. ProjecTILs atlases
+
+```{r projectils_functions}
+# Project the samples onto one atlas. Cached: projecting takes a minute or two
+# per atlas and the result is deterministic. Returns NULL if the reference
+# file is absent so the document still knits.
+project_ref <- function(reffile, tag){
+  qcache  <- paste0(robjectsDir, "projectils_query_", tag, ".rds")
+  bgcache <- paste0(robjectsDir, "projectils_ref_bg_", tag, ".rds")
+
+  if(!file.exists(qcache) || !file.exists(bgcache)){
+    if(!file.exists(reffile)) return(NULL)
+    ref <- load.reference.map(reffile)
+
+    if(!file.exists(qcache)){
+      # filter.cells = FALSE: ProjecTILs' default filter drops anything that
+      # does not look like a T cell, and a bulk mixture can fail that test
+      q <- make.projection(obj, ref = ref, filter.cells = FALSE, ncores = 1)
+      q <- cellstate.predict(ref = ref, query = q)
+      saveRDS(q, qcache)
+    }
+    emb <- Embeddings(ref, "umap")
+    bg  <- data.frame(UMAP_1 = emb[,1], UMAP_2 = emb[,2], state = factor(ref$functional.cluster))
+    set.seed(1); bg <- bg[sample(nrow(bg), min(6000, nrow(bg))), ]
+    saveRDS(bg, bgcache)
+  }
+
+  q  <- readRDS(qcache); bg <- readRDS(bgcache)
+  proj <- as.data.frame(Embeddings(q, "umap")); colnames(proj) <- c("UMAP_1","UMAP_2")
+  proj$state <- q$functional.cluster
+  proj$conf  <- q$functional.cluster.conf
+  proj$label <- colnames(q)
+  proj <- proj %>% left_join(meta, by = "label")
+
+  lv <- union(levels(factor(bg$state)), unique(proj$state))
+  bg$state   <- factor(bg$state, levels = lv)
+  proj$state <- factor(proj$state, levels = lv)
+  list(proj = proj, bg = bg, cols = state_palette(lv))
+}
+
+# grey reference with state labels; samples drawn on top
+# flip_y reverses the y axis so the atlas sits in the orientation used in the
+# published ProjecTILs figures. Everything drawn on top - labels, hulls, arrows -
+# is in data coordinates, so it flips with the axis and stays correct.
+base_umap <- function(p, flip_y = FALSE){
+  cent <- p$bg %>% group_by(state) %>%
+    summarise(UMAP_1 = median(UMAP_1), UMAP_2 = median(UMAP_2), .groups = "drop")
+  g <- ggplot() +
+    geom_point(data = p$bg, aes(UMAP_1, UMAP_2), colour = "grey78", size = 0.7, alpha = 0.7) +
+    geom_label(data = cent, aes(UMAP_1, UMAP_2, label = state), size = 2.7, fontface = "bold",
+               fill = "white", alpha = 0.7, label.size = 0) +
+    theme_bw() + theme(panel.grid = element_blank())
+  if(flip_y) g <- g + scale_y_reverse()
+  g
+}
+
+overview_plot <- function(p, title)
+  base_umap(p) +
+  geom_point(data = p$proj, aes(UMAP_1, UMAP_2), colour = "black", size = 2.4, alpha = 0.85) +
+  ggtitle(title)
+
+# samples coloured by treatment, and the mean position of each treatment at
+# each timepoint joined in time order, so the trajectory across the atlas is
+# visible. Hours printed at each vertex.
+trajectory_plot <- function(p, title, flip_y = FALSE){
+  mn <- p$proj %>% group_by(treatment, time) %>%
+    summarise(UMAP_1 = mean(UMAP_1), UMAP_2 = mean(UMAP_2), .groups = "drop") %>%
+    arrange(treatment, time)
+  base_umap(p, flip_y) +
+    geom_point(data = p$proj, aes(UMAP_1, UMAP_2, fill = treatment),
+               shape = 21, size = 2.6, stroke = 0.2, colour = "grey15", alpha = 0.8) +
+    geom_path(data = mn, aes(UMAP_1, UMAP_2, colour = treatment, group = treatment),
+              linewidth = 0.8, arrow = grid::arrow(length = grid::unit(0.16,"cm"), type = "closed")) +
+    geom_text_repel(data = mn, aes(UMAP_1, UMAP_2, label = gsub("h","",time)),
+                    size = 2.6, max.overlaps = Inf, show.legend = FALSE) +
+    scale_fill_manual(values = treatment_colours, name = "Treatment") +
+    scale_colour_manual(values = treatment_colours, guide = "none") +
+    ggtitle(title)
+}
+
+# Coloured atlas: every reference cell coloured by its state. alpha controls
+# how far it recedes - 0.8 to look at the atlas on its own, ~0.3 as an underlay
+# with samples drawn over it.
+base_umap_coloured <- function(p, flip_y = FALSE, alpha = 0.8, size = 0.7){
+  cent <- p$bg %>% group_by(state) %>%
+    summarise(UMAP_1 = median(UMAP_1), UMAP_2 = median(UMAP_2), .groups = "drop")
+  g <- ggplot() +
+    geom_point(data = p$bg, aes(UMAP_1, UMAP_2, colour = state), size = size, alpha = alpha) +
+    scale_colour_manual(values = p$cols, name = "Atlas state",
+                        guide = guide_legend(override.aes = list(alpha = 1, size = 3))) +
+    geom_label(data = cent, aes(UMAP_1, UMAP_2, label = state), size = 2.7, fontface = "bold",
+               fill = "white", alpha = 0.75, label.size = 0) +
+    theme_bw() + theme(panel.grid = element_blank())
+  if(flip_y) g <- g + scale_y_reverse()
+  g
+}
+
+# the reference alone, coloured, with no samples - to compare the embedding
+# in the .rds against the published atlas figure
+reference_plot <- function(p, title, flip_y = FALSE)
+  base_umap_coloured(p, flip_y, alpha = 0.8) + ggtitle(title)
+
+# coloured atlas as a transparent underlay, samples and trajectories on top.
+# ggnewscale::new_scale_colour() opens a second colour scale so the atlas
+# states and the treatments do not fight over one legend.
+trajectory_plot_coloured <- function(p, title, flip_y = FALSE){
+  mn <- p$proj %>% group_by(treatment, time) %>%
+    summarise(UMAP_1 = mean(UMAP_1), UMAP_2 = mean(UMAP_2), .groups = "drop") %>%
+    arrange(treatment, time)
+  base_umap_coloured(p, flip_y, alpha = 0.3, size = 0.6) +
+    ggnewscale::new_scale_colour() +
+    geom_point(data = p$proj, aes(UMAP_1, UMAP_2, fill = treatment),
+               shape = 21, size = 2.8, stroke = 0.4, colour = "black", alpha = 0.9) +
+    geom_path(data = mn, aes(UMAP_1, UMAP_2, colour = treatment, group = treatment),
+              linewidth = 0.9, arrow = grid::arrow(length = grid::unit(0.16,"cm"), type = "closed")) +
+    geom_text_repel(data = mn, aes(UMAP_1, UMAP_2, label = gsub("h","",time)),
+                    size = 2.6, max.overlaps = Inf, show.legend = FALSE,
+                    bg.color = "white", bg.r = 0.15) +
+    scale_fill_manual(values = treatment_colours, name = "Treatment") +
+    scale_colour_manual(values = treatment_colours, guide = "none") +
+    ggtitle(title)
+}
+
+# predicted state composition for each treatment x timepoint (three replicates).
+# dplyr::count is spelled out: SingleR pulls in matrixStats, whose count()
+# masks dplyr's and errors on a data frame.
+state_composition <- function(p, title){
+  cc <- p$proj %>% dplyr::count(treatment, time, state) %>%
+    group_by(treatment, time) %>% mutate(frac = n/sum(n)) %>% ungroup()
+  ggplot(cc, aes(time, frac, fill = state)) +
+    geom_col() +
+    facet_wrap(~treatment, nrow = 1) +
+    scale_fill_manual(values = p$cols, name = "state") +
+    labs(title = title, x = NULL, y = "fraction of replicates") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+}
+
+state_table <- function(p){
+  p$proj %>%
+    dplyr::select(label, treatment, time, replicate, state, conf) %>%
+    mutate(conf = round(conf, 2)) %>%
+    arrange(treatment, time, replicate)
+}
+```
+
+```{r run_projections}
+# cache tags carry _noNC so the earlier all-sample projections are not reused
+TIL  <- project_ref(paste0(refDir, "ref_TILAtlas_mouse_v1.rds"), "TIL_noNC")
+LCMV <- project_ref(paste0(refDir, "ref_CD8_LCMV_mouse_v2.rds"),  "LCMV_noNC")
+have_til  <- !is.null(TIL)
+have_lcmv <- !is.null(LCMV)
+```
+
+```{r ref_status, results = "asis", echo = FALSE}
+if(!have_til)  cat("**TIL atlas not found** in `", refDir, "` - section 3.1 is empty.\n\n", sep = "")
+if(!have_lcmv) cat("**LCMV atlas not found** in `", refDir, "` - section 3.2 is empty.\n\n", sep = "")
+```
+
+#### 3.1 TIL atlas
+
+```{r til_overview, fig.width = 9, fig.height = 7, eval = have_til}
+overview_plot(TIL, "Samples (black) on the TIL atlas")
+ggsave(paste0(imageDir, "TIL_overview.pdf"), width = 9, height = 7)
+```
+
+```{r til_trajectory, fig.width = 10, fig.height = 7.5, eval = have_til}
+trajectory_plot(TIL, "TIL atlas: each treatment through the timecourse")
+ggsave(paste0(imageDir, "TIL_trajectory.pdf"), width = 10, height = 7.5)
+```
+
+```{r til_reference_coloured, fig.width = 10, fig.height = 7.5, eval = have_til}
+# the atlas on its own, coloured by state, nothing projected
+reference_plot(TIL, "TIL atlas reference, coloured by state")
+ggsave(paste0(imageDir, "TIL_reference_coloured.pdf"), width = 10, height = 7.5)
+```
+
+```{r til_trajectory_coloured, fig.width = 11, fig.height = 7.5, eval = have_til}
+trajectory_plot_coloured(TIL, "TIL atlas: coloured states underneath, treatments through the timecourse on top")
+ggsave(paste0(imageDir, "TIL_trajectory_coloured.pdf"), width = 11, height = 7.5)
+```
+
+```{r til_composition, fig.width = 13, fig.height = 4.5, eval = have_til}
+state_composition(TIL, "TIL atlas: predicted state per treatment and timepoint")
+ggsave(paste0(imageDir, "TIL_state_composition.pdf"), width = 13, height = 4.5)
+write.csv(state_table(TIL), paste0(tableDir, "projectils_TIL_states.csv"), row.names = FALSE)
+```
+
+```{r til_table, echo = FALSE, eval = have_til}
+datatable(state_table(TIL), options = list(pageLength = 15))
+```
+
+#### 3.2 Acute-infection CD8 atlas (LCMV)
+
+```{r lcmv_overview, fig.width = 9, fig.height = 7, eval = have_lcmv}
+overview_plot(LCMV, "Samples (black) on the LCMV CD8 atlas")
+ggsave(paste0(imageDir, "LCMV_overview.pdf"), width = 9, height = 7)
+```
+
+```{r lcmv_trajectory, fig.width = 10, fig.height = 7.5, eval = have_lcmv}
+trajectory_plot(LCMV, "LCMV atlas: each treatment through the timecourse")
+ggsave(paste0(imageDir, "LCMV_trajectory.pdf"), width = 10, height = 7.5)
+```
+
+```{r lcmv_trajectory_flipped, fig.width = 10, fig.height = 7.5, eval = have_lcmv}
+# the same plot with the y axis reversed, matching the orientation of the
+# published LCMV atlas so it can sit next to the reference figure in the paper
+trajectory_plot(LCMV, "LCMV atlas: each treatment through the timecourse (published orientation, y reversed)",
+                flip_y = TRUE)
+ggsave(paste0(imageDir, "LCMV_trajectory_flipped.pdf"), width = 10, height = 7.5)
+```
+
+```{r lcmv_reference_coloured, fig.width = 10, fig.height = 7.5, eval = have_lcmv}
+# the atlas on its own, coloured by state, both orientations
+reference_plot(LCMV, "LCMV atlas reference, coloured by state")
+ggsave(paste0(imageDir, "LCMV_reference_coloured.pdf"), width = 10, height = 7.5)
+reference_plot(LCMV, "LCMV atlas reference, coloured by state (published orientation, y reversed)", flip_y = TRUE)
+ggsave(paste0(imageDir, "LCMV_reference_coloured_flipped.pdf"), width = 10, height = 7.5)
+```
+
+```{r lcmv_trajectory_coloured, fig.width = 11, fig.height = 7.5, eval = have_lcmv}
+trajectory_plot_coloured(LCMV, "LCMV atlas: coloured states underneath, treatments through the timecourse on top")
+ggsave(paste0(imageDir, "LCMV_trajectory_coloured.pdf"), width = 11, height = 7.5)
+trajectory_plot_coloured(LCMV, "LCMV atlas, coloured underlay (published orientation, y reversed)", flip_y = TRUE)
+ggsave(paste0(imageDir, "LCMV_trajectory_coloured_flipped.pdf"), width = 11, height = 7.5)
+```
+
+```{r lcmv_composition, fig.width = 13, fig.height = 4.5, eval = have_lcmv}
+state_composition(LCMV, "LCMV atlas: predicted state per treatment and timepoint")
+ggsave(paste0(imageDir, "LCMV_state_composition.pdf"), width = 13, height = 4.5)
+write.csv(state_table(LCMV), paste0(tableDir, "projectils_LCMV_states.csv"), row.names = FALSE)
+```
+
+```{r lcmv_table, echo = FALSE, eval = have_lcmv}
+datatable(state_table(LCMV), options = list(pageLength = 15))
+```
+
+### 4. ImmGen via SingleR
+
+```{r immgen_reference}
+# ImmGen curated to peripheral T-cell states, exactly as in PMC225. The
+# activation clock (CTR through 96H) is the part that matters most here.
+ref <- ImmGenData()
+short <- sub(".*\\((.*)\\)", "\\1", ref$label.fine)
+state <- dplyr::case_when(
+  grepl("^T\\.8Nve|^T\\.8NVE", short)   ~ "CD8 naive",
+  grepl("^T\\.4Nve|^T\\.4NVE", short)   ~ "CD4 naive",
+  grepl("^T\\.CD8\\.CTR", short)        ~ "CD8 act 0h",
+  grepl("^T\\.CD8\\.1H", short)         ~ "CD8 act 1h",
+  grepl("^T\\.CD8\\.5H", short)         ~ "CD8 act 5h",
+  grepl("^T\\.CD8\\.24H", short)        ~ "CD8 act 24h",
+  grepl("^T\\.CD8\\.48H", short)        ~ "CD8 act 48h",
+  grepl("^T\\.CD8\\.96H", short)        ~ "CD8 act 96h",
+  grepl("^T\\.CD4\\.CTR", short)        ~ "CD4 act 0h",
+  grepl("^T\\.CD4\\.1H", short)         ~ "CD4 act 1h",
+  grepl("^T\\.CD4\\.5H", short)         ~ "CD4 act 5h",
+  grepl("^T\\.CD4\\.24H", short)        ~ "CD4 act 24h",
+  grepl("^T\\.CD4\\.48H", short)        ~ "CD4 act 48h",
+  grepl("^T\\.CD4\\.96H", short)        ~ "CD4 act 96h",
+  grepl("^T\\.8EFF", short)             ~ "CD8 effector",
+  grepl("^T\\.8Mem|^T\\.8MEM", short)   ~ "CD8 memory",
+  grepl("^T\\.4Mem|^T\\.4MEM", short)   ~ "CD4 memory",
+  grepl("Tregs|FP3\\+25\\+", short)     ~ "Treg",
+  TRUE ~ NA_character_
+)
+keep <- !is.na(state)
+ref_sub <- ref[, keep]; ref_sub$state <- state[keep]
+cat("reference states kept:\n"); print(table(ref_sub$state))
+
+# ordered levels: naive -> activation clock -> effector/memory -> Treg
+lv_all <- c("CD8 naive","CD4 naive","CD8 act 0h","CD4 act 0h","CD8 act 1h","CD4 act 1h",
+            "CD8 act 5h","CD4 act 5h","CD8 act 24h","CD4 act 24h","CD8 act 48h","CD4 act 48h",
+            "CD8 act 96h","CD4 act 96h","CD8 effector","CD8 memory","CD4 memory","Treg")
+```
+
+```{r singler_run}
+# SingleR on the log-normalised expression, one label per sample. Cached.
+cache <- paste0(robjectsDir, "singleR_immgen_noNC.rds")
+if(file.exists(cache)){
+  pred <- readRDS(cache)
+} else {
+  qexpr <- GetAssayData(obj, assay = "RNA", layer = "data")
+  pred  <- SingleR(test = qexpr, ref = ref_sub, labels = ref_sub$state, de.method = "classic")
+  saveRDS(pred, cache)
+}
+
+sr <- meta %>%
+  mutate(singleR = pred$labels[match(label, rownames(pred))],
+         pruned  = pred$pruned.labels[match(label, rownames(pred))])
+lv <- lv_all[lv_all %in% sr$singleR]
+sr$singleR <- factor(sr$singleR, levels = lv)
+scols <- setNames(colorRampPalette(c("#3E5496","#4DAF4A","#FF7F00","#B2182B","#D01556"))(length(lv)), lv)
+
+write.csv(sr %>% dplyr::select(label, treatment, time, replicate, singleR, pruned),
+          paste0(tableDir, "singleR_immgen_labels.csv"), row.names = FALSE)
+
+knitr::kable(as.data.frame(table(state = sr$singleR)) %>% filter(Freq > 0) %>% arrange(-Freq))
+```
+
+#### 4.1 Label per treatment and timepoint
+
+```{r singler_composition, fig.width = 13, fig.height = 4.5}
+cc <- sr %>% dplyr::count(treatment, time, singleR) %>%
+  group_by(treatment, time) %>% mutate(frac = n/sum(n)) %>% ungroup()
+p <- ggplot(cc, aes(time, frac, fill = singleR)) +
+  geom_col() +
+  facet_wrap(~treatment, nrow = 1) +
+  scale_fill_manual(values = scols, name = "ImmGen state") +
+  labs(title = "SingleR / ImmGen label per treatment and timepoint",
+       x = NULL, y = "fraction of replicates") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+p
+ggsave(paste0(imageDir, "immgen_label_composition.pdf"), p, width = 13, height = 4.5)
+```
+
+#### 4.2 Similarity to every reference state
+
+```{r singler_scores, fig.width = 12, fig.height = 8}
+# The full SingleR score matrix, not just the winning label: how similar each
+# sample is to every reference state. Columns ordered treatment then time so
+# the activation clock reads left to right within each treatment. This is the
+# figure that shows whether the 24-120h culture tracks ImmGen's in-vitro
+# activation timecourse, and whether the cytokines differ in where they sit.
+sc <- pred$scores
+rownames(sc) <- rownames(pred)
+sc <- sc[, intersect(lv_all, colnames(sc)), drop = FALSE]
+
+ord <- sr %>% arrange(treatment, time, replicate) %>% pull(label)
+sc  <- sc[ord, , drop = FALSE]
+
+# sr carries meta's row names; column_to_rownames refuses a frame that already has them
+ann <- sr %>% dplyr::select(label, treatment, time) %>% remove_rownames() %>% column_to_rownames("label")
+ann <- ann[ord, , drop = FALSE]
+ann_cols <- list(treatment = treatment_colours[levels(droplevels(ann$treatment))],
+                 time = setNames(colorRampPalette(c("grey90","grey20"))(nlevels(droplevels(ann$time))),
+                                 levels(droplevels(ann$time))))
+
+pheatmap(t(sc),
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         annotation_col = ann, annotation_colors = ann_cols,
+         show_colnames = FALSE,
+         color = colorRampPalette(c("white","#FF8C00","#B2182B"))(100),
+         main = "SingleR similarity to ImmGen T-cell states",
+         filename = paste0(imageDir, "immgen_score_heatmap.pdf"), width = 12, height = 8)
+pheatmap(t(sc),
+         cluster_rows = FALSE, cluster_cols = FALSE,
+         annotation_col = ann, annotation_colors = ann_cols,
+         show_colnames = FALSE,
+         color = colorRampPalette(c("white","#FF8C00","#B2182B"))(100),
+         main = "SingleR similarity to ImmGen T-cell states")
+```
+
+#### 4.3 Where on the activation clock
+
+```{r activation_clock, fig.width = 12, fig.height = 5}
+# Just the CD8 activation-clock states, as trajectories: for each treatment,
+# how similarity to each ImmGen activation timepoint changes across our own
+# timecourse. If culture time dominates, all treatments move the same way; if
+# a cytokine holds cells earlier or pushes them later, its line separates.
+clock <- c("CD8 naive","CD8 act 0h","CD8 act 1h","CD8 act 5h","CD8 act 24h","CD8 act 48h","CD8 act 96h","CD8 effector")
+clock <- intersect(clock, colnames(sc))
+
+cl <- as.data.frame(sc[, clock, drop = FALSE]) %>%
+  rownames_to_column("label") %>%
+  pivot_longer(-label, names_to = "ref_state", values_to = "score") %>%
+  left_join(sr %>% dplyr::select(label, treatment, time), by = "label") %>%
+  mutate(ref_state = factor(ref_state, levels = clock))
+
+cl_mean <- cl %>% group_by(ref_state, treatment, time) %>%
+  summarise(score = mean(score), .groups = "drop")
+
+p <- ggplot(cl_mean, aes(time, score, colour = treatment, group = treatment)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.6) +
+  facet_wrap(~ref_state, nrow = 2, scales = "free_y") +
+  scale_colour_manual(values = treatment_colours) +
+  labs(title = "Similarity to each ImmGen CD8 activation-clock state, over our timecourse",
+       x = NULL, y = "SingleR score (Spearman)", colour = "Treatment") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+p
+ggsave(paste0(imageDir, "immgen_activation_clock.pdf"), p, width = 12, height = 5)
+```
+
+### 5. Session info
+
+```{r session_info}
+sessionInfo()
+```

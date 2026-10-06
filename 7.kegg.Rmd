@@ -1,0 +1,378 @@
+---
+title: "KEGG pathway maps: JUN / NF-kB signalling under IL2, IL7-15, IL18 and IL36"
+output:
+  rmarkdown::html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 5
+vignette: >
+  %\VignetteIndexEntry{ben_legg_kegg}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+  %\VignetteBuild{true}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+### 1. Workplace setup
+
+```{r setup, warning = FALSE, include = FALSE}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(purrr)
+library(stringr)
+library(ggplot2)
+library(org.Mm.eg.db)
+library(clusterProfiler)
+library(pathview)
+library(KEGGREST)
+library(DT)
+```
+
+#### 1.1 Directory structure
+
+```{r directory_setup, warning = FALSE}
+# 1. make sure the bioinf_scratch drive is mounted
+# 2. make sure you are on a network that can reach KEGG - pathview and
+#    enrichKEGG both download from rest.kegg.jp and fail silently offline
+# 3. session -> set working directory -> scripts
+
+######## directory structure #######
+projectDir=paste0("../")
+resultsDir=paste0(projectDir,"/results")
+imageDir=paste0(resultsDir,"/figures/")
+tableDir = paste(resultsDir,"/tables/",sep="")
+# KEGG downloads and the rendered maps go here, not into scripts/
+keggDir = paste(resultsDir,"/kegg/",sep="")
+
+system(paste("mkdir -p",imageDir))
+system(paste("mkdir -p",tableDir))
+system(paste("mkdir -p",keggDir))
+```
+
+#### 1.2 What this document does
+
+The differential expression comes from `6a.analysis.Rmd`; this document reads
+its contrast tables and paints the fold changes onto KEGG maps. Nothing is
+re-fitted here.
+
+KEGG enrichment is run for sets 3 and 4 only (the two time-matched
+cytokine-versus-cytokine comparisons). The maps are shown once per set:
+
+| Set | Contrast | Maps per pathway | Colour strips per gene |
+|---|---|---|---|
+| 2 | each cytokine vs its time-matched NC | three, one each at 24h, 48h, 72h | IL2, IL715, IL18, IL36b |
+| 3 | IL18 + IL36b vs IL2 | one | 24h, 48h, 72h, 96h, 120h |
+| 4 | IL18 + IL36b vs IL2 + IL7-15 | one | 24h, 48h, 72h, 96h, 120h |
+
+Set 2 shows what each cytokine does on its own against untreated culture.
+Sets 3 and 4 show the IL18/IL36b programme against the gamma-c cytokines
+through time on a single map.
+
+### 2. Pathway selection
+
+```{r pathway_selection, warning = FALSE}
+# Chosen by hand from current KEGG, for maps that carry JUN and NF-kB subunits
+# and sit on the IL-1-family (IL18, IL36) or gamma-c (IL2, IL7, IL15) axes.
+#
+# Not chosen from msigdbr: its KEGG sets are the 2011 LEGACY snapshot, which
+# predates the NF-kB (2013), TNF (2014) and IL-17 (2017) maps entirely.
+#
+# The first block carries both JUN and NF-kB. The last two carry neither but
+# are where the four cytokines and their receptors actually live, so they are
+# kept as the receptor-level context.
+kegg_pathways <- c(
+  mmu04064 = "NF-kappa B signaling pathway",
+  mmu04010 = "MAPK signaling pathway",
+  mmu04660 = "T cell receptor signaling pathway",
+  mmu04668 = "TNF signaling pathway",
+  mmu04621 = "NOD-like receptor signaling pathway",
+  mmu04620 = "Toll-like receptor signaling pathway",
+  mmu04657 = "IL-17 signaling pathway",
+  # receptor-level context, no JUN
+  mmu04630 = "JAK-STAT signaling pathway",
+  mmu04060 = "Cytokine-cytokine receptor interaction",
+  # the ONLY KEGG mouse map that contains Batf (checked with keggLink). KEGG
+  # draws AP-1 as a generic JUN/FOS node on the signalling maps and never lists
+  # the dimer partners, so Batf is absent from every map above despite being
+  # Jun's partner. This map carries Jun, Fos, Nfkb1, Rela, Batf and Batf3
+  # together, and is biologically apt: BATF mediates PD-1 inhibitory signalling
+  # in T cells.
+  mmu05235 = "PD-L1 expression and PD-1 checkpoint pathway"
+)
+
+# genes used to check each map really contains what it was chosen for
+check_genes <- list(
+  JUN      = c("Jun","Junb","Jund"),
+  BATF     = c("Batf","Batf3"),
+  NFKB     = c("Nfkb1","Nfkb2","Rela","Relb","Rel"),
+  IL2_axis = c("Il2","Il2ra","Il2rb","Il2rg"),
+  IL7_15   = c("Il7","Il7r","Il15","Il15ra"),
+  IL18     = c("Il18","Il18r1","Il18rap"),
+  IL36     = c("Il1rl2","Il1rap","Il36a","Il36b","Il36g","Il1f6","Il1f8","Il1f9")
+)
+```
+
+```{r pathway_verify, warning = FALSE}
+# Pull the current gene membership of each map from KEGG and report which of
+# the check genes it contains. Wrapped in tryCatch: if KEGG is unreachable
+# this table is skipped rather than killing the document.
+verify_pathway <- function(id){
+  genes <- tryCatch({
+    g <- KEGGREST::keggGet(id)[[1]]$GENE
+    # GENE alternates KEGG id, "SYMBOL; description"
+    sub(";.*$", "", g[seq(2, length(g), by = 2)])
+  }, error = function(e) NULL)
+
+  if(is.null(genes)) return(data.frame(pathway = id, status = "KEGG unreachable"))
+
+  out <- sapply(check_genes, function(cg) paste(intersect(cg, genes), collapse = " "))
+  data.frame(pathway = id, name = kegg_pathways[[id]], n_genes = length(genes),
+             t(out), stringsAsFactors = FALSE, check.names = FALSE)
+}
+
+pathway_check <- bind_rows(lapply(names(kegg_pathways), verify_pathway))
+knitr::kable(pathway_check)
+```
+
+### 3. Load the contrasts
+
+```{r load_contrasts, warning = FALSE}
+# Contrast tables written by 6a.analysis.Rmd. Each is gene, logFC, logCPM, F,
+# PValue, FDR with gene symbols as the key.
+read_contrast <- function(subdir, name){
+  f <- paste0(tableDir, subdir, "/", name, ".csv")
+  if(!file.exists(f)) stop("contrast table not found, run 6a.analysis.Rmd first: ", f)
+  read.csv(f, stringsAsFactors = FALSE) %>% dplyr::select(gene, logFC, FDR)
+}
+
+timepoints    <- c("24h","48h","72h","96h","120h")
+timepoints_nc <- c("24h","48h","72h")          # NC only exists at these
+cytokines     <- c("IL2","IL715","IL18","IL36b")
+
+# set 2: each cytokine vs its time-matched NC. One list per timepoint, each
+# holding the four cytokines, because that is how the maps are drawn.
+contrasts_set2 <- setNames(lapply(timepoints_nc, function(tp){
+  setNames(lapply(cytokines, function(cyt)
+    read_contrast("vs_NC", paste0(cyt, "_", tp, "_vs_NC_", tp))), cytokines)
+}), timepoints_nc)
+
+# sets 3 and 4 across the timecourse
+contrasts_set3 <- setNames(lapply(timepoints, function(tp)
+  read_contrast("IL18_IL36b_vs_IL2", paste0("IL18_IL36b_vs_IL2_", tp))), timepoints)
+
+contrasts_set4 <- setNames(lapply(timepoints, function(tp)
+  read_contrast("IL18_IL36b_vs_IL2_IL715", paste0("IL18_IL36b_vs_IL2_IL715_", tp))), timepoints)
+
+# one logFC matrix per map: genes x states, joined by symbol so a gene missing
+# from one table stays NA rather than shifting rows.
+# purrr:: is spelled out because org.Mm.eg.db loads IRanges, whose reduce()
+# masks purrr's and errors on a plain list.
+logfc_matrix <- function(contrast_list){
+  purrr::reduce(purrr::imap(contrast_list, ~ .x %>% dplyr::select(gene, !!.y := logFC)),
+                full_join, by = "gene") %>%
+    column_to_rownames("gene") %>%
+    as.matrix()
+}
+
+mat_set2 <- lapply(contrasts_set2, logfc_matrix)   # one matrix per timepoint
+mat_set3 <- logfc_matrix(contrasts_set3)
+mat_set4 <- logfc_matrix(contrasts_set4)
+
+cat("genes:", nrow(mat_set3),
+    " | set 2 maps per pathway:", length(mat_set2),
+    " | set 3/4 strips per gene:", ncol(mat_set3), "\n")
+```
+
+```{r entrez_mapping, warning = FALSE}
+# pathview wants Entrez IDs. Same bitr mapping as the dane_rnaseq analysis,
+# done once on the union of genes and then applied to each matrix.
+all_genes <- unique(c(rownames(mat_set3), rownames(mat_set4),
+                      unlist(lapply(mat_set2, rownames))))
+
+sym2entrez <- bitr(all_genes, fromType = "SYMBOL", toType = "ENTREZID",
+                   OrgDb = org.Mm.eg.db) %>%
+  distinct(SYMBOL, .keep_all = TRUE) %>%
+  distinct(ENTREZID, .keep_all = TRUE)
+
+cat("symbols mapped to Entrez:", nrow(sym2entrez), "of", length(all_genes), "\n")
+
+to_entrez <- function(m){
+  keep <- rownames(m) %in% sym2entrez$SYMBOL
+  m <- m[keep, , drop = FALSE]
+  rownames(m) <- sym2entrez$ENTREZID[match(rownames(m), sym2entrez$SYMBOL)]
+  m
+}
+
+mat_set2_e <- lapply(mat_set2, to_entrez)
+mat_set3_e <- to_entrez(mat_set3)
+mat_set4_e <- to_entrez(mat_set4)
+```
+
+### 4. KEGG enrichment, sets 3 and 4
+
+```{r enrich_kegg, warning = FALSE}
+# Which KEGG pathways are enriched among the DE genes of the two cytokine-
+# versus-cytokine sets at each timepoint:
+#   set 3: IL18 + IL36b vs IL2
+#   set 4: IL18 + IL36b vs IL2 + IL7-15
+# Only these two, because both sides are time-matched cytokine groups; sets 1
+# and 2 carry the naive or culture baseline and their enrichment would mostly
+# report that. Same enrichKEGG call as the dane_rnaseq analysis. Needs KEGG;
+# skipped with a message if unreachable.
+enrich_one <- function(tbl, label){
+  de <- tbl %>% filter(FDR < 0.05, abs(logFC) >= 1) %>% pull(gene)
+  ids <- sym2entrez$ENTREZID[match(de, sym2entrez$SYMBOL)]
+  ids <- ids[!is.na(ids)]
+  if(length(ids) < 10) return(NULL)
+
+  kk <- tryCatch(enrichKEGG(gene = ids, organism = "mmu", keyType = "kegg",
+                            pvalueCutoff = 0.05),
+                 error = function(e) NULL)
+  if(is.null(kk) || nrow(as.data.frame(kk)) == 0) return(NULL)
+
+  as.data.frame(kk) %>%
+    transmute(contrast = label, ID, Description = sub(" - Mus musculus.*$", "", Description),
+              GeneRatio, p.adjust = signif(p.adjust, 3), Count)
+}
+
+# the two per-set lists are joined into one list BEFORE bind_rows. Handed two
+# named lists as separate arguments, bind_rows treats each as a data frame
+# whose columns are the timepoints and fails on the size mismatch.
+enrich_list <- c(
+  purrr::imap(contrasts_set3, ~ enrich_one(.x, paste0("set3_", .y))),
+  purrr::imap(contrasts_set4, ~ enrich_one(.x, paste0("set4_", .y)))
+)
+
+kegg_enrich <- bind_rows(enrich_list) %>%
+  mutate(set = sub("_.*$", "", contrast),
+         timepoint = factor(sub("^set[34]_", "", contrast), levels = timepoints)) %>%
+  dplyr::select(set, timepoint, ID, Description, GeneRatio, p.adjust, Count)
+
+if(nrow(kegg_enrich) == 0){
+  cat("No KEGG enrichment returned (KEGG unreachable, or nothing significant).\n")
+} else {
+  write.csv(kegg_enrich, paste0(tableDir, "kegg_enrichment_sets3_4.csv"), row.names = FALSE)
+
+  cat("--- of the selected pathways, which are enriched, in which set, and when ---\n")
+  knitr::kable(kegg_enrich %>% filter(ID %in% names(kegg_pathways)) %>%
+                 arrange(ID, set, timepoint))
+}
+```
+
+```{r enrich_kegg_table, echo = FALSE}
+if(nrow(kegg_enrich) > 0){
+  datatable(kegg_enrich, extensions = 'Buttons',
+            options = list(pageLength = 15, scrollX = TRUE, dom = 'Bfrtip',
+                           buttons = c('copy','csv','excel')))
+}
+```
+
+### 5. Pathway maps
+
+```{r pathview_function, include = FALSE}
+# pathview writes into the working directory, so it is run from inside keggDir
+# and the finished PNG path is handed back. Downloads are cached in keggDir
+# too, so each map is fetched from KEGG once.
+#
+# limit caps the colour scale at +/- 2 log2FC, as in the dane_rnaseq analysis:
+# signalling genes rarely exceed it, and without the cap a handful of extreme
+# genes would wash out everything else.
+logfc_cap <- 2
+
+run_pathview <- function(gene_mat, pathway_id, suffix){
+  owd <- setwd(keggDir); on.exit(setwd(owd))
+
+  multi <- ncol(gene_mat) > 1
+  out <- paste0(pathway_id, ".", suffix, if(multi) ".multi", ".png")
+
+  ok <- tryCatch({
+    pathview(gene.data   = gene_mat,
+             pathway.id  = pathway_id,
+             species     = "mmu",
+             limit       = list(gene = logfc_cap),
+             low         = list(gene = "#0096FF"),
+             mid         = list(gene = "white"),
+             high        = list(gene = "#F20D0D"),
+             out.suffix  = suffix,
+             kegg.dir    = ".",
+             multi.state = multi,
+             same.layer  = TRUE)
+    TRUE
+  }, error = function(e){ message(pathway_id, ": ", conditionMessage(e)); FALSE })
+
+  if(ok && file.exists(out)) out else NA_character_
+}
+
+# draws one map and embeds it, or says why it could not
+show_map <- function(gene_mat, pathway_id, suffix){
+  png <- run_pathview(gene_mat, pathway_id, suffix)
+  if(is.na(png)){
+    cat("Map not produced - KEGG unreachable or pathway unavailable.\n\n")
+  } else {
+    # path relative to scripts/, which is where the document knits from
+    cat("![](", file.path(keggDir, png), ")\n\n", sep = "")
+  }
+}
+
+strip_note <- function(gene_mat){
+  cat("Colour strips per gene, left to right: **",
+      paste(colnames(gene_mat), collapse = ", "), "**. ",
+      "Red = up, blue = down, capped at +/-", logfc_cap, " log2FC.\n\n", sep = "")
+}
+```
+
+#### 5.1 Set 2: each cytokine vs its time-matched NC
+
+```{r maps_set2, results = "asis"}
+# three maps per pathway, one per timepoint at which an NC exists. Strips are
+# the four cytokines, so the map reads as "what does each cytokine do to this
+# pathway, on its own, at this time".
+strip_note(mat_set2_e[[1]])
+
+for(id in names(kegg_pathways)){
+  cat("\n\n##### ", id, " ", kegg_pathways[[id]], "\n\n", sep = "")
+  for(tp in timepoints_nc){
+    cat("\n\n###### ", tp, "\n\n", sep = "")
+    show_map(mat_set2_e[[tp]], id, paste0("set2_", tp))
+  }
+}
+```
+
+#### 5.2 Set 3: IL18 + IL36b vs IL2
+
+```{r maps_set3, results = "asis"}
+# one map per pathway, strips are the five timepoints
+strip_note(mat_set3_e)
+
+for(id in names(kegg_pathways)){
+  cat("\n\n##### ", id, " ", kegg_pathways[[id]], "\n\n", sep = "")
+  show_map(mat_set3_e, id, "set3_timecourse")
+}
+```
+
+#### 5.3 Set 4: IL18 + IL36b vs IL2 + IL7-15
+
+```{r maps_set4, results = "asis"}
+strip_note(mat_set4_e)
+
+for(id in names(kegg_pathways)){
+  cat("\n\n##### ", id, " ", kegg_pathways[[id]], "\n\n", sep = "")
+  show_map(mat_set4_e, id, "set4_timecourse")
+}
+```
+
+### 6. Session info
+
+```{r session_info}
+sessionInfo()
+```

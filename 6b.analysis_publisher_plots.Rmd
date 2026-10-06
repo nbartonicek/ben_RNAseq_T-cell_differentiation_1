@@ -1,0 +1,2138 @@
+---
+title: "Cytokine-driven T-cell differentiation timecourse"
+output:
+  rmarkdown::html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 5
+vignette: >
+  %\VignetteIndexEntry{ben_legg_cytokine_timecourse}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+  %\VignetteBuild{true}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+### 1. Workplace setup
+
+```{r setup, warning = FALSE, include = FALSE}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(forcats)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(edgeR)
+library(org.Mm.eg.db)
+library(msigdbr)
+library(clusterProfiler)
+library(pheatmap)
+library(DT)
+library(patchwork)
+```
+
+#### 1.1 Directory structure
+
+```{r directory_setup, warning = FALSE, echo=F}
+# 1. make sure the bioinf_scratch drive is mounted
+# 2. session -> set working directory -> scripts
+
+######## directory structure #######
+projectDir=paste0("../")
+resultsDir=paste0(projectDir,"/results")
+imageDir=paste0(resultsDir,"/figures/")
+robjectsDir = paste(resultsDir,"/Robjects/",sep="")
+tableDir = paste(resultsDir,"/tables/",sep="")
+
+system(paste("mkdir -p",robjectsDir))
+system(paste("mkdir -p",tableDir))
+system(paste("mkdir -p",imageDir))
+
+# counts come from 5.feature_counts.sbatch, one file per sample
+inDir<-paste0(resultsDir,"/counts/featurecounts/")
+```
+
+#### 1.2 Experimental design
+
+Naive T-cells cultured with one of four cytokines across a timecourse, against
+a negative control (NC) and an uncultured naive baseline.
+
+1. **NC only exists at 24h, 48h and 72h.** The 96h and 120h cytokine samples
+   have no time-matched control. 
+2. **Batch is handled by sample selection, not by modelling.** Four libraries
+   were resequenced in a second batch (`GMP5RJ`). The three IL36b_96h reruns
+   overlapped their batch 1 originals exactly, so the reruns were dropped and
+   IL36b_96h is entirely batch 1. The IL2_96h rep 3 rerun is kept, because its
+   batch 1 original failed and the rerun behaves like its group-mates. Batch is
+   therefore not a term in the DE model. One further sample, IL715_24h rep 3,
+   was removed as an outlier, so that group has two replicates.
+
+
+
+```{r colours, warning = FALSE, echo=F}
+# IL2 / IL7_15 / IL36 keep the same colours used in the dane_rnaseq analysis so
+# the two Ben projects can be read side by side. IL18 is new here and takes
+# orange. Naive and NC are greys, because they are references rather than
+# treatments of interest.
+treatment_colours <- c(
+  "Naive" = "gray70",
+  "NC"    = "gray40",
+  "IL2"   = "#F20D0D",
+  "IL715" = "#00B050",
+  "IL18"  = "#FF8C00",
+  "IL36b" = "#0096FF"
+)
+
+# Direction colours, shared by the volcanoes and the pathway dotplot.
+direction_colours <- c(
+  "DOWN" = "#0096FF",
+  "NO"   = "gray60",
+  "UP"   = "#F20D0D"
+)
+```
+
+```{r volcano_function, include = FALSE, echo=F}
+# Same volcano used in 8.ben_volcanoes.Rmd. Pass highlight_genes to label a
+# fixed marker list instead of every significant gene.
+plot_volcano <- function(top,
+                         FDR_cutoff = 0.05,
+                         max.overlaps = 30,
+                         highlight_genes = NULL) {
+  top <- as.data.frame(top)
+
+  # Rename column if needed
+  if ("adj.P.Val" %in% colnames(top)) {
+    top <- top %>%
+      rename(FDR = adj.P.Val)
+  }
+
+  # Differential expression flags. Built with ifelse rather than by indexing
+  # into a subset, so a contrast with no significant genes does not error.
+  top$diff_expression <- "NO"
+  top$diff_expression[top$logFC >= 1  & top$FDR <= FDR_cutoff] <- "UP"
+  top$diff_expression[top$logFC <= -1 & top$FDR <= FDR_cutoff] <- "DOWN"
+
+  # Label logic
+  top$labelgenes <- ""
+  if (!is.null(highlight_genes)) {
+    highlight_genes_present <- intersect(highlight_genes, rownames(top))
+    top[rownames(top) %in% highlight_genes_present, "labelgenes"] <-
+      rownames(top)[rownames(top) %in% highlight_genes_present]
+  } else {
+    top[top$diff_expression != "NO", "labelgenes"] <-
+      rownames(top[top$diff_expression != "NO", ])
+  }
+
+  ggplot(top, aes(x = logFC, y = -log10(FDR), color = diff_expression, label = labelgenes)) +
+    geom_point(size = 1.8) +
+    geom_text_repel(
+      max.overlaps = max.overlaps,
+      min.segment.length = 0,       # always draw line
+      segment.color = "grey40",     # color of connecting line
+      segment.size = 0.6,           # thickness of the line
+      box.padding = 0.3,
+      point.padding = 0.25,
+      seed = 123                    # reproducible layout
+    ) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "darkred") +
+    geom_hline(yintercept = -log10(FDR_cutoff), linetype = "dashed", color = "darkred") +
+    scale_color_manual(values = direction_colours) +
+    theme_classic(base_size = 12) +
+    labs(
+      x = "log2 Fold Change",
+      y = "-log10(FDR)",
+      color = "Differential expression",
+      title = "Volcano plot"
+    )
+}
+```
+
+### 2. QC
+
+#### 2.1 Import data
+
+```{r data_import, warning = FALSE, echo=F}
+rObjectFile<-paste0(robjectsDir,"featurecounts_files.Rdata")
+
+# featureCounts writes a "# Program:.." banner, then a wide table whose LAST
+# column holds the counts and is named after the input BAM path.
+if(!file.exists(rObjectFile)){
+  inFiles<-list.files(inDir,full.names=T, pattern=".featureCounts.txt$")
+  results<-list()
+  for(inFile in inFiles){
+
+    sampleName<-basename(inFile)
+    sampleName<-gsub(".featureCounts.txt","",sampleName)
+    sampleName<-gsub("_trimmed","",sampleName)
+
+    data<-read.delim(inFile,comment.char="#")
+
+    cat(sampleName)
+    cat("\n")
+    results[[sampleName]]<-data[,ncol(data)]
+  }
+
+  df<-do.call("cbind",results)
+  df<-as.data.frame(df)
+  row.names(df)<-data$Geneid
+  save(df,file=rObjectFile)
+} else {
+  load(rObjectFile)
+}
+
+# ---- samples excluded from every analysis ----
+#
+# 1. 3SQMBY_65 was a failed library (23MB against ~870MB for everything else).
+#    Its batch 2 rerun GMP5RJ_3 replaces it, and that rerun sits where it should
+#    on the PCA, so it is kept.
+# 2. The three IL36b_96h batch 2 reruns overlap their batch 1 originals exactly
+#    on the PCA, so they add nothing. Dropping them and keeping the originals
+#    makes IL36b_96h entirely batch 1, which removes the batch confound in that
+#    group rather than having to model around it.
+# 3. 3SQMBY_52 (IL715_24h rep 3) is a PCA outlier.
+#
+# After these exclusions the only batch 2 sample left is IL2_96h rep 3, which
+# behaves like its group-mates - which is why batch is deliberately NOT a term
+# in the DE model below.
+excluded_samples <- c(
+  "3SQMBY_65_IL2_96h_rep_3",            # failed library, superseded by GMP5RJ_3
+  "GMP5RJ_1_rerun_IL36b_96h_rep_1_20",  # duplicates 3SQMBY_20
+  "GMP5RJ_2_rerun_IL36b_96h_rep_2_44",  # duplicates 3SQMBY_44
+  "GMP5RJ_4_rerun_IL36b_96h_rep_3_68",  # duplicates 3SQMBY_68
+  "3SQMBY_52_IL715_24h_rep_3"           # outlier
+)
+
+missing <- setdiff(excluded_samples, colnames(df))
+if(length(missing) > 0){
+  stop("excluded sample not found in the count matrix: ", paste(missing, collapse=", "))
+}
+
+df <- df[, !colnames(df) %in% excluded_samples]
+
+cat("\ngenes:", nrow(df), " samples:", ncol(df), "\n")
+```
+
+#### 2.2 Sample metadata
+
+```{r design_matrix, warning = FALSE, echo=F}
+#   3SQMBY_10_IL18_48h_rep_1              (batch 1)
+#   GMP5RJ_1_rerun_IL36b_96h_rep_1_20     (batch 2, trailing number = original index)
+sample_names <- colnames(df)
+
+batch <- ifelse(grepl("^GMP5RJ", sample_names), "batch2", "batch1")
+
+core <- gsub("^3SQMBY_[0-9]+_", "", sample_names)
+core <- gsub("^GMP5RJ_[0-9]+_rerun_", "", core)
+# only the batch 2 names carry a trailing original index; stripping it from
+# batch 1 names would remove the replicate number instead
+core <- ifelse(batch == "batch2", gsub("_[0-9]+$", "", core), core)
+
+replicate <- gsub(".*_rep_", "", core)
+body      <- gsub("_rep_[0-9]+$", "", core)
+treatment <- gsub("_.*", "", body)
+# naive samples have no timepoint in the name, they are the 0h baseline
+time      <- ifelse(grepl("_", body), gsub(".*_", "", body), "0h")
+
+design_matrix <- tibble(
+  sample_name = sample_names,
+  treatment   = factor(treatment, levels = names(treatment_colours)),
+  time        = factor(time, levels = c("0h","24h","48h","72h","96h","120h")),
+  replicate   = replicate,
+  batch       = batch
+) %>%
+  mutate(
+    group = paste(treatment, time, sep = "_"),
+    label = paste(treatment, time, paste0("rep", replicate), sep = "_")
+  )
+
+row.names(design_matrix) <- design_matrix$sample_name
+
+# stop early if a filename did not parse, rather than fitting a broken model
+stopifnot(!any(is.na(design_matrix$treatment)))
+stopifnot(!any(is.na(design_matrix$time)))
+stopifnot(!anyDuplicated(design_matrix$label))
+
+# use the readable labels from here on
+batch <- gsub("batch","b",batch)
+colnames(df) <- paste0(design_matrix$label, "_", batch)
+
+write.csv(design_matrix, paste0(tableDir,"sample_metadata.csv"), row.names = FALSE)
+
+datatable(design_matrix, options = list(pageLength = 10))
+```
+
+```{r group_sizes, warning = FALSE}
+# sanity check on group sizes. Every group has three replicates except
+# IL715_24h, which has two after the outlier was dropped.
+design_matrix %>%
+  count(group, batch) %>%
+  arrange(group) %>%
+  as.data.frame()
+```
+
+#### 2.2b Design completeness
+
+```{r design_heatmap, fig.width = 7, fig.height = 4}
+# How many replicates exist for every treatment x timepoint combination.
+# White = nothing sequenced, dark red = the most replicates present. This makes
+# the holes in the design visible at a glance: naive exists only at 0h, and NC
+# was only collected at 24/48/72h, which is why the 96h and 120h cytokine
+# samples have no time-matched control.
+design_counts <- design_matrix %>%
+  count(treatment, time, name = "n") %>%
+  tidyr::complete(treatment, time, fill = list(n = 0)) %>%
+  # dark tiles need light text, pale tiles need dark text
+  mutate(label_colour = ifelse(n > max(n)/2, "white", "black"))
+
+p <- ggplot(design_counts, aes(x = time, y = fct_rev(treatment), fill = n)) +
+  geom_tile(colour = "grey70") +
+  geom_text(aes(label = n, colour = label_colour), size = 4, show.legend = FALSE) +
+  scale_colour_identity() +
+  scale_fill_gradient(low = "white", high = "darkred", limits = c(0, NA)) +
+  labs(title = "Replicates per treatment and timepoint",
+       x = "Timepoint", y = NULL, fill = "n replicates") +
+  coord_fixed() +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+p
+
+ggsave(paste0(imageDir,"design_completeness.pdf"), p, width = 7, height = 4)
+```
+
+#### 2.3 Annotate with gene symbols
+
+```{r annotation, warning = FALSE}
+# Same approach as the dane_rnaseq analysis: map Ensembl -> Entrez -> symbol,
+# then collapse duplicated symbols keeping the row with the larger total count.
+egENSEMBL <- toTable(org.Mm.egENSEMBL)
+ids <- gsub("\\..*","",row.names(df))
+row.names(df) <- ids
+
+m <- match(row.names(df), egENSEMBL$ensembl_id)
+df$EntrezGene <- egENSEMBL$gene_id[m]
+
+egSYMBOL <- toTable(org.Mm.egSYMBOL)
+m <- match(df$EntrezGene, egSYMBOL$gene_id)
+df$symbol <- egSYMBOL$symbol[m]
+
+#eliminate duplicated symbols, keep the one with a larger overall count
+o <- order(rowSums(df[,1:(dim(df)[2]-2)]), decreasing=TRUE)
+df <- df[o,]
+d <- duplicated(df$symbol)
+df <- df[!d,]
+df <- df[!is.na(df$symbol),]
+row.names(df) <- df$symbol
+
+counts <- df %>%
+  dplyr::select(-EntrezGene, -symbol)
+
+# keep the metadata in the same order as the count columns
+#design_matrix <- design_matrix[match(colnames(counts), design_matrix$label),]
+
+cat("genes with symbols:", nrow(counts), "\n")
+```
+
+#### 2.4 Library sizes
+
+```{r library_sizes, fig.width = 12, fig.height = 5}
+lib_df <- design_matrix %>%
+  mutate(lib_size = colSums(counts))
+
+p <- ggplot(lib_df, aes(x = label, y = lib_size/1e6, fill = treatment)) +
+  geom_col() +
+  scale_fill_manual(values = treatment_colours) +
+  labs(title = "Assigned reads per sample, after UMI deduplication",
+       x = NULL, y = "Millions of assigned reads") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6))
+p
+
+ggsave(paste0(imageDir,"library_sizes.pdf"), p, width = 12, height = 5)
+```
+
+#### 2.5 MDS plot
+
+```{r mds_plot, fig.width = 9, fig.height = 7}
+group <- factor(design_matrix$group)
+
+y <- DGEList(counts = counts, group = group)
+keep <- filterByExpr(y, group = group)
+y <- y[keep, , keep.lib.sizes = FALSE]
+y <- calcNormFactors(y)
+
+cat("genes retained after filterByExpr:", nrow(y), "\n")
+
+mds_result <- plotMDS(y, top = 1000, plot = FALSE)
+
+sample_df <- design_matrix %>%
+  mutate(PCA1 = mds_result$x,
+         PCA2 = mds_result$y)
+
+# colour by cytokine, shape by timepoint - one colour per group would give 24
+# colours and no readable structure
+p <- ggplot(sample_df, aes(x = PCA1, y = PCA2, color = treatment, shape = time, label = label)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(size = 2.5, max.overlaps = 30, show.legend = F) +
+  scale_color_manual(values = treatment_colours) +
+  labs(title = "MDS plot",
+       x = "Dimension 1",
+       y = "Dimension 2") +
+  theme_minimal()
+p
+
+ggsave(paste0(imageDir,"MDS_plot.pdf"), p, width = 9, height = 7)
+```
+
+```{r mds_batch, fig.width = 9, fig.height = 7}
+# the same MDS coloured by batch. If batch 2 samples sit apart from their
+# batch 1 group-mates, the IL36b_96h contrasts carry a batch effect that
+# cannot be separated from the cytokine effect.
+p <- ggplot(sample_df, aes(x = PCA1, y = PCA2, color = batch, shape = time, label = label)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(data = subset(sample_df, batch == "batch2"),
+                           size = 3, max.overlaps = 30, show.legend = F) +
+  scale_color_manual(values = c("batch1" = "gray70", "batch2" = "#F20D0D")) +
+  labs(title = "MDS plot, coloured by sequencing batch",
+       x = "Dimension 1", y = "Dimension 2") +
+  theme_minimal()
+p
+
+ggsave(paste0(imageDir,"MDS_plot_batch.pdf"), p, width = 9, height = 7)
+```
+
+#### 2.6 PCA trajectories
+
+```{r pca_function, warning = FALSE}
+n_var_genes <- 2000
+
+# Eta squared: the share of a component's variance explained by one factor.
+# PC1 is usually dominated by time, but the axis separating the cytokines is
+# often further down, so both axes are chosen by this rather than assumed.
+eta_sq <- function(values, grouping){
+  grouping <- factor(grouping)
+  grand  <- mean(values)
+  ss_tot <- sum((values - grand)^2)
+  ss_bet <- sum(tapply(values, grouping, function(x) length(x) * (mean(x) - grand)^2))
+  if(ss_tot == 0) return(0)
+  ss_bet / ss_tot
+}
+
+# PCA is recomputed on whatever subset is passed in, rather than the full PCA
+# being filtered down. A PCA fitted to one timepoint finds the axes that
+# separate the cytokines at that timepoint, which is the point of subsetting.
+make_pca <- function(keep, title, file, arrows = TRUE, colour_gene = NULL,
+                     label_time = FALSE, method = c("pca","mds")){
+  method <- match.arg(method)
+  dm  <- design_matrix[keep, , drop = FALSE]
+  cnt <- counts[, keep, drop = FALSE]
+  if(nrow(dm) < 3) return(NULL)
+
+  d <- DGEList(counts = cnt, group = dm$group)
+  k <- filterByExpr(d, group = dm$group)
+  d <- d[k, , keep.lib.sizes = FALSE]
+  d <- calcNormFactors(d)
+  lc <- log2(cpm(d, log = FALSE) + 1)
+
+  gene_vars <- apply(lc, 1, var)
+  top_var <- names(sort(gene_vars, decreasing = TRUE))[1:min(n_var_genes, length(gene_vars))]
+
+  if(method == "pca"){
+    # PCA on the most variable genes; components carry a % of total variance
+    ord    <- prcomp(t(lc[top_var, ]), center = TRUE, scale. = FALSE)
+    coords <- ord$x
+    pv     <- 100 * ord$sdev^2 / sum(ord$sdev^2)
+    ax_name <- "PC"
+  } else {
+    # edgeR/limma MDS: distances are the leading log fold changes between each
+    # pair of samples, computed on the top genes for that pair. With few samples
+    # this is usually better behaved than PCA, which is driven by whichever
+    # genes happen to be most variable overall.
+    #
+    # The coordinates have to be reconstructed: limma 3.64 dropped the
+    # cmdscale.out component the MDS object used to carry. Its plotted x and y
+    # are eigen.vectors scaled by sqrt(eigen.values), checked exact against
+    # md$x and md$y. Negative eigenvalues can occur, so only positive ones are
+    # used for the dimensions offered to the axis selection below.
+    md  <- plotMDS(d, top = 500, plot = FALSE)
+    eva <- md$eigen.values
+    ev  <- md$eigen.vectors
+    k   <- max(2, min(8, sum(eva > 0)))
+    coords <- sweep(ev[, seq_len(k), drop = FALSE], 2, sqrt(eva[seq_len(k)]), "*")
+    pv      <- 100 * md$var.explained[seq_len(k)]
+    ax_name <- "Leading logFC dim "
+  }
+
+  npc    <- min(10, ncol(coords))
+  n_time <- length(unique(as.character(dm$time)))
+  draw_arrows <- arrows && n_time > 1
+
+  eta_time <- sapply(seq_len(npc), function(i) eta_sq(coords[,i], dm$time))
+  eta_trt  <- sapply(seq_len(npc), function(i) eta_sq(coords[,i], dm$treatment))
+
+  # axis label, omitting the variance term when the method does not define one
+  mk_lab <- function(i, eta_val, what){
+    if(is.na(pv[i])) sprintf("%s%d (%s eta2=%.2f)", ax_name, i, what, eta_val)
+    else sprintf("%s%d (%.1f%% variance; %s eta2=%.2f)", ax_name, i, pv[i], what, eta_val)
+  }
+
+  if(draw_arrows){
+    ax <- which.max(eta_time)
+    ay <- which.max(replace(eta_trt, ax, -Inf))
+    xlab <- mk_lab(ax, eta_time[ax], "time axis,")
+    ylab <- mk_lab(ay, eta_trt[ay],  "condition axis,")
+  } else {
+    # a single timepoint has no time axis to find, so use the first two dimensions
+    ax <- 1; ay <- 2
+    xlab <- mk_lab(1, eta_trt[1], "condition")
+    ylab <- mk_lab(2, eta_trt[2], "condition")
+  }
+
+  df <- dm %>% mutate(x = coords[, ax], y = coords[, ay])
+
+  # numeric hours, used as the on-point label. "0" is naive.
+  df$time_num <- as.numeric(gsub("h", "", as.character(df$time)))
+
+  # colour_gene overlays one gene's expression on the same coordinates. Matched
+  # case-insensitively because mouse symbols are Batf, not BATF.
+  if(!is.null(colour_gene)){
+    gi <- match(tolower(colour_gene), tolower(rownames(lc)))
+    if(is.na(gi)) stop("gene not found in the filtered expression matrix: ", colour_gene)
+    df$gene_expr <- as.numeric(lc[gi, ])
+  }
+
+  mn <- df %>%
+    group_by(treatment, time) %>%
+    summarise(x = mean(x), y = mean(y), .groups = "drop") %>%
+    arrange(treatment, time)
+
+  # convex hull round the replicates of each treatment x timepoint.
+  # stat_ellipse is unreliable at n = 3, a hull is not.
+  hl <- df %>%
+    group_by(treatment, time) %>%
+    filter(n() >= 3) %>%
+    slice(chull(x, y)) %>%
+    ungroup()
+
+  if(is.null(colour_gene)){
+    # standard version: one colour per treatment
+    g <- ggplot() +
+      geom_polygon(data = hl, aes(x, y, fill = treatment, group = interaction(treatment, time)),
+                   alpha = 0.15, colour = NA) +
+      geom_point(data = df, aes(x, y, colour = treatment), size = 2.2, alpha = 0.9)
+
+    if(draw_arrows){
+      g <- g + geom_path(data = mn, aes(x, y, colour = treatment, group = treatment),
+                         linewidth = 0.7,
+                         arrow = grid::arrow(length = grid::unit(0.18, "cm"), type = "closed"))
+    }
+
+    g <- g +
+      scale_colour_manual(values = treatment_colours) +
+      scale_fill_manual(values = treatment_colours)
+
+  } else {
+    # gene version: treatment identity drops back to grey so the only thing
+    # carrying colour is the expression of that one gene
+    g <- ggplot() +
+      geom_polygon(data = hl, aes(x, y, group = interaction(treatment, time)),
+                   fill = "grey75", alpha = 0.25, colour = NA) +
+      geom_point(data = df, aes(x, y, colour = gene_expr), size = 2.8)
+
+    if(draw_arrows){
+      g <- g + geom_path(data = mn, aes(x, y, group = treatment),
+                         colour = "grey55", linewidth = 0.5,
+                         arrow = grid::arrow(length = grid::unit(0.18, "cm"), type = "closed"))
+    }
+
+    g <- g +
+      scale_colour_gradient(low = "grey88", high = "darkred",
+                            name = paste0(colour_gene, "\nlog2(CPM+1)"))
+  }
+
+  # small number above each dot saying which timepoint it is, so the order of
+  # the trajectory can be read off the points themselves rather than inferred
+  # from the arrow directions
+  if(label_time){
+    g <- g + geom_text(data = df, aes(x, y, label = time_num),
+                       size = 2.2, vjust = -0.9, colour = "grey15",
+                       show.legend = FALSE, inherit.aes = FALSE)
+  }
+
+  g <- g +
+    labs(title = title,
+         subtitle = if(draw_arrows)
+           "Shaded regions are replicates at each timepoint; arrows connect condition means"
+         else
+           "Shaded regions are replicates; single timepoint, so no trajectory",
+         x = xlab, y = ylab, colour = "Treatment", fill = "Treatment") +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+
+  ggsave(paste0(imageDir, file), g, width = 12, height = 7)
+
+  eta_df <- data.frame(PC = paste0(ifelse(method == "pca", "PC", "dim"), seq_len(npc)),
+                       pct_var = round(pv[seq_len(npc)], 1),
+                       eta_time = round(eta_time, 2),
+                       eta_treatment = round(eta_trt, 2))
+
+  list(plot = g, eta = eta_df, n = nrow(dm))
+}
+```
+
+##### 2.6.1 All samples
+
+```{r pca_all, fig.width = 12, fig.height = 7}
+res <- make_pca(rep(TRUE, nrow(design_matrix)),
+                "Sample movement over time (PCA)", "PCA_trajectory.pdf")
+res$eta
+res$plot
+```
+
+##### 2.6.2 Without naive
+
+```{r pca_no_naive, fig.width = 12, fig.height = 7}
+# naive sits far from everything else and is a single timepoint with no
+# trajectory, so dropping it lets the cultured conditions spread out
+res <- make_pca(design_matrix$treatment != "Naive",
+                "PCA, naive excluded", "PCA_trajectory_no_naive.pdf")
+res$plot
+```
+
+##### 2.6.3 Without NC
+
+```{r pca_no_nc, fig.width = 12, fig.height = 7}
+# removes the untreated culture control, so the axes are driven by differences
+# between the cytokines rather than by treated versus untreated
+res <- make_pca(design_matrix$treatment != "NC",
+                "PCA, NC excluded", "PCA_trajectory_no_NC.pdf")
+res$plot
+```
+
+##### 2.6.4 24h only
+
+```{r pca_24h, fig.width = 12, fig.height = 7}
+# one timepoint, so no trajectory: this asks purely how far apart the
+# cytokines are from each other at 24h
+res <- make_pca(design_matrix$time == "24h",
+                "PCA, 24h samples only", "PCA_24h.pdf", arrows = FALSE)
+res$eta
+res$plot
+```
+
+##### 2.6.5 120h only
+
+```{r pca_120h, fig.width = 12, fig.height = 7}
+# the same question at the end of the timecourse. NC does not exist at 120h,
+# so this is cytokines only.
+res <- make_pca(design_matrix$time == "120h",
+                "PCA, 120h samples only", "PCA_120h.pdf", arrows = FALSE)
+res$eta
+res$plot
+```
+
+##### 2.6.6 Sample movement with timepoints labelled
+
+```{r pca_labelled, fig.width = 12, fig.height = 7, results = "asis"}
+# The trajectory plots again, with each dot carrying its timepoint in hours.
+# Naive is 0. This makes the order along each path readable directly, instead
+# of having to follow the arrowheads.
+labelled_subsets <- list(
+  "all samples"   = list(keep = rep(TRUE, nrow(design_matrix)),     file = "PCA_trajectory_labelled.pdf"),
+  "naive removed" = list(keep = design_matrix$treatment != "Naive", file = "PCA_trajectory_no_naive_labelled.pdf"),
+  "NC removed"    = list(keep = design_matrix$treatment != "NC",    file = "PCA_trajectory_no_NC_labelled.pdf"),
+  "NC + naive removed" = list(keep = !design_matrix$treatment %in% c("NC", "Naive"),
+                               file = "PCA_trajectory_no_NC_no_naive_labelled.pdf")
+)
+
+for(nm in names(labelled_subsets)){
+  spec <- labelled_subsets[[nm]]
+  cat("\n\n###### ", nm, "\n\n", sep="")
+  res <- make_pca(spec$keep,
+                  paste0("Sample movement over time, ", nm),
+                  spec$file, arrows = TRUE, label_time = TRUE)
+  if(is.null(res)){ cat("Not enough samples.\n\n"); next }
+  print(res$plot)
+  cat("\n\n")
+}
+```
+
+##### 2.6.7 The same PCAs coloured by Batf expression
+
+```{r pca_batf, fig.width = 12, fig.height = 7, results = "asis"}
+# A PCA cannot be computed on a single gene - one gene is one dimension - so
+# these are the same five decompositions with Batf's normalised expression
+# overlaid on the points instead of treatment identity.
+colour_gene <- "Batf"
+
+pca_subsets <- list(
+  "all samples"   = list(keep = rep(TRUE, nrow(design_matrix)),      arrows = TRUE,  file = "PCA_Batf_all.pdf"),
+  "naive removed" = list(keep = design_matrix$treatment != "Naive",  arrows = TRUE,  file = "PCA_Batf_no_naive.pdf"),
+  "NC removed"    = list(keep = design_matrix$treatment != "NC",     arrows = TRUE,  file = "PCA_Batf_no_NC.pdf"),
+  "24h only"      = list(keep = design_matrix$time == "24h",         arrows = FALSE, file = "PCA_Batf_24h.pdf"),
+  "120h only"     = list(keep = design_matrix$time == "120h",        arrows = FALSE, file = "PCA_Batf_120h.pdf")
+)
+
+for(nm in names(pca_subsets)){
+  spec <- pca_subsets[[nm]]
+  cat("\n\n###### Batf, ", nm, "\n\n", sep="")
+  # label_time follows arrows: the multi-timepoint panels get the hours printed
+  # on each dot, the single-timepoint ones do not, since every point there would
+  # carry the same number
+  res <- make_pca(spec$keep,
+                  paste0("Batf expression on PCA, ", nm),
+                  spec$file, arrows = spec$arrows, colour_gene = colour_gene,
+                  label_time = spec$arrows)
+  if(is.null(res)){ cat("Not enough samples.\n\n"); next }
+  print(res$plot)
+  cat("\n\n")
+}
+```
+
+##### 2.6.8 24h and 120h, cleaner views
+
+```{r pca_mds_alternatives, fig.width = 12, fig.height = 7, results = "asis"}
+# The single-timepoint PCAs are hard to read: with 11-14 samples PCA is driven
+# by whichever genes happen to be most variable, and NC sits far from the
+# cytokines and stretches the axes. Two remedies, shown side by side:
+#   - drop NC, so the axes are set by differences between the cytokines
+#   - use edgeR's MDS instead, whose distances are leading log fold changes
+#     between sample pairs and which behaves better at small n
+#
+# Note there is no "120h without NC" panel: NC stops at 72h, so the existing
+# 120h plot already contains no NC.
+alt_views <- list(
+  list(nm = "24h, NC removed (PCA)",
+       keep = design_matrix$time == "24h" & design_matrix$treatment != "NC",
+       method = "pca", file = "PCA_24h_no_NC.pdf"),
+  list(nm = "24h, all samples (MDS)",
+       keep = design_matrix$time == "24h",
+       method = "mds", file = "MDS_24h.pdf"),
+  list(nm = "24h, NC removed (MDS)",
+       keep = design_matrix$time == "24h" & design_matrix$treatment != "NC",
+       method = "mds", file = "MDS_24h_no_NC.pdf"),
+  list(nm = "120h, all samples (MDS)",
+       keep = design_matrix$time == "120h",
+       method = "mds", file = "MDS_120h.pdf")
+)
+
+for(v in alt_views){
+  cat("\n\n###### ", v$nm, "\n\n", sep="")
+  res <- make_pca(v$keep, v$nm, v$file, arrows = FALSE, method = v$method)
+  if(is.null(res)){ cat("Not enough samples.\n\n"); next }
+  print(res$plot)
+  cat("\n\n")
+}
+```
+
+##### 2.6.9 120h samples, coloured by individual genes
+
+```{r pca_120h_genes, fig.width = 12, fig.height = 7, results = "asis"}
+# The 120h-only PCA again, but coloured by single genes rather than treatment.
+# At the final timepoint the question is whether the cytokines have separated,
+# and whether that separation tracks the stemness/memory axis - Tcf7 and Id3
+# are the two markers usually used to read that.
+#
+# Coordinates are the 120h PCA, recomputed on those samples only, so the axes
+# are the ones that separate the cytokines at 120h rather than axes inherited
+# from the full timecourse.
+genes_on_pca_120h <- c("Tcf7", "Id3")
+
+for(g in genes_on_pca_120h){
+  cat("\n\n###### ", g, ", 120h samples\n\n", sep="")
+
+  # a gene filtered out by filterByExpr should not kill the whole document
+  res <- tryCatch(
+    make_pca(design_matrix$time == "120h",
+             paste0(g, " expression on PCA, 120h samples only"),
+             paste0("PCA_120h_", g, ".pdf"),
+             arrows = FALSE, colour_gene = g),
+    error = function(e){ cat("Could not plot ", g, ": ", conditionMessage(e), "\n\n", sep=""); NULL }
+  )
+
+  if(is.null(res)) next
+  print(res$plot)
+  cat("\n\n")
+}
+```
+
+
+##### 2.6.10 Publisher-ready PCA plots: NC removed, circles only, shared 0h baseline
+
+```{r pca_publisher_ready, fig.width = 12, fig.height = 7}
+# Publication-oriented versions requested for figure assembly.
+#
+# IMPORTANT: the naive samples are NOT duplicated or altered in the PCA itself.
+# PCA is fitted once to the real samples (Naive + four cytokine conditions; NC removed).
+# For the trajectory overlay only, the mean Naive coordinate is used as the common 0h
+# starting point for each cytokine. This is a visual representation of the experimental
+# design: all four cytokine cultures begin from the same uncultured naive population.
+# It avoids falsely pretending that four separate cytokine-specific 0h samples existed.
+#
+# All sample symbols are circles. Both PDF and SVG are written for editing in Publisher.
+
+make_publisher_pca <- function(label_time = TRUE,
+                               file_stub = "PCA_timecourse_no_NC_shared_0h") {
+  keep <- design_matrix$treatment != "NC"
+  dm   <- design_matrix[keep, , drop = FALSE]
+  cnt  <- counts[, keep, drop = FALSE]
+
+  d <- DGEList(counts = cnt, group = dm$group)
+  k <- filterByExpr(d, group = dm$group)
+  d <- d[k, , keep.lib.sizes = FALSE]
+  d <- calcNormFactors(d)
+  lc <- log2(cpm(d, log = FALSE) + 1)
+
+  gene_vars <- apply(lc, 1, var)
+  top_var <- names(sort(gene_vars, decreasing = TRUE))[1:min(n_var_genes, length(gene_vars))]
+  ord <- prcomp(t(lc[top_var, , drop = FALSE]), center = TRUE, scale. = FALSE)
+  coords <- ord$x
+  pv <- 100 * ord$sdev^2 / sum(ord$sdev^2)
+
+  npc <- min(10, ncol(coords))
+  eta_time <- sapply(seq_len(npc), function(i) eta_sq(coords[, i], dm$time))
+  eta_trt  <- sapply(seq_len(npc), function(i) eta_sq(coords[, i], dm$treatment))
+  ax <- which.max(eta_time)
+  ay <- which.max(replace(eta_trt, ax, -Inf))
+
+  df <- dm %>%
+    mutate(x = coords[, ax], y = coords[, ay],
+           time_num = as.numeric(gsub("h", "", as.character(time))))
+
+  # Actual replicate points. Naive remains a single biological group at 0h.
+  hl <- df %>%
+    group_by(treatment, time) %>%
+    filter(n() >= 3) %>%
+    slice(chull(x, y)) %>%
+    ungroup()
+
+  cytokines_plot <- c("IL2", "IL715", "IL18", "IL36b")
+
+  # Mean coordinates for cytokine samples from 24-120 h.
+  mn_cyt <- df %>%
+    filter(treatment %in% cytokines_plot) %>%
+    group_by(treatment, time) %>%
+    summarise(x = mean(x), y = mean(y), .groups = "drop") %>%
+    arrange(treatment, time)
+
+  # One common naive centroid, copied only in the plotting data so every trajectory
+  # can visibly start at the same experimentally shared 0h baseline.
+  naive_mean <- df %>%
+    filter(treatment == "Naive") %>%
+    summarise(x = mean(x), y = mean(y))
+
+  trajectory_means <- bind_rows(lapply(cytokines_plot, function(cyt) {
+    bind_rows(
+      data.frame(treatment = cyt, time = factor("0h", levels = levels(dm$time)),
+                 x = naive_mean$x, y = naive_mean$y),
+      mn_cyt %>% filter(treatment == cyt)
+    )
+  })) %>%
+    mutate(treatment = factor(treatment, levels = levels(dm$treatment)),
+           time_num = as.numeric(gsub("h", "", as.character(time))))
+
+  g <- ggplot() +
+    geom_polygon(data = hl,
+                 aes(x, y, fill = treatment, group = interaction(treatment, time)),
+                 alpha = 0.12, colour = NA) +
+    geom_path(data = trajectory_means,
+              aes(x, y, colour = treatment, group = treatment),
+              linewidth = 0.75,
+              arrow = grid::arrow(length = grid::unit(0.18, "cm"), type = "closed")) +
+    # shape 16 forces every point to be a circle; time is not mapped to shape.
+    geom_point(data = df, aes(x, y, colour = treatment), shape = 16, size = 2.5, alpha = 0.9) +
+    scale_colour_manual(values = treatment_colours) +
+    scale_fill_manual(values = treatment_colours) +
+    labs(title = "Sample movement over time (PCA)",
+         subtitle = "NC excluded; cytokine trajectories share the naive 0 h centroid",
+         x = sprintf("PC%d (%.1f%% variance; time eta2=%.2f)", ax, pv[ax], eta_time[ax]),
+         y = sprintf("PC%d (%.1f%% variance; condition eta2=%.2f)", ay, pv[ay], eta_trt[ay]),
+         colour = "Treatment", fill = "Treatment") +
+    theme_bw(base_size = 12) +
+    theme(panel.grid.minor = element_blank())
+
+  if (label_time) {
+    # Label the trajectory means rather than every replicate: much cleaner for publication.
+    g <- g + geom_text(data = trajectory_means,
+                       aes(x, y, label = time_num, colour = treatment),
+                       size = 2.6, vjust = -0.9, show.legend = FALSE)
+  }
+
+  print(g)
+  ggsave(paste0(imageDir, file_stub, ".pdf"), g, width = 12, height = 7,
+         device = cairo_pdf)
+  ggsave(paste0(imageDir, file_stub, ".svg"), g, width = 12, height = 7,
+         device = "svg")
+
+  invisible(g)
+}
+
+p_publisher <- make_publisher_pca()
+```
+
+##### 2.6.11 Publisher-ready PCA without naive
+
+```{r pca_publisher_no_naive, fig.width = 12, fig.height = 7}
+# Alternative if you decide the shared-baseline display is visually confusing.
+# This version removes both NC and Naive and shows only the observed 24-120 h
+# cytokine trajectories. Again, every symbol is a circle and both vector formats
+# are exported.
+
+keep_pub <- !design_matrix$treatment %in% c("NC", "Naive")
+res_pub <- make_pca(keep_pub,
+                    "Sample movement over time (PCA; 24-120 h)",
+                    "PCA_timecourse_cytokines_only.pdf",
+                    arrows = TRUE, label_time = TRUE)
+
+p_pub_no_naive <- res_pub$plot +
+  # make_pca already uses circles because shape is not mapped there; this layer is
+  # retained only through the original plot, so no timepoint-specific icons appear.
+  labs(subtitle = "NC and naive excluded; observed cytokine samples only")
+
+print(p_pub_no_naive)
+ggsave(paste0(imageDir, "PCA_timecourse_cytokines_only.pdf"),
+       p_pub_no_naive, width = 12, height = 7, device = cairo_pdf)
+ggsave(paste0(imageDir, "PCA_timecourse_cytokines_only.svg"),
+       p_pub_no_naive, width = 12, height = 7, device = "svg")
+```
+
+### 3. Differential expression
+
+#### 3.1 edgeR model and the four contrast sets
+
+```{r edger_analysis, warnings = F, include = FALSE}
+# One model fitted across all samples. All four contrast sets are pulled out of
+# this single fit, so they share one dispersion estimate and stay comparable.
+group <- factor(design_matrix$group)
+design <- model.matrix(~0+group)
+colnames(design) <- levels(group)
+
+y <- DGEList(counts = counts, group = group)
+keep <- filterByExpr(y, design)
+y <- y[keep, , keep.lib.sizes = FALSE]
+y <- calcNormFactors(y)
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+
+cytokines      <- c("IL2","IL715","IL18","IL36b")
+timepoints_all <- c("24h","48h","72h","96h","120h")
+timepoints_nc  <- c("24h","48h","72h")   # the only timepoints that have an NC
+
+for(d in c("vs_naive","vs_NC","IL18_IL36b_vs_IL2","IL18_IL36b_vs_IL2_IL715")){
+  system(paste("mkdir -p", paste0(tableDir,d)))
+}
+
+# Each contrast is stored as the makeContrasts expression plus the list of
+# groups it needs. Storing the expression rather than a pair of names is what
+# lets sets 3 and 4 average two groups on one side of the comparison.
+mk <- function(expr, groups) list(expr = expr, groups = groups)
+
+# runs one contrast off the shared fit, writes its table, returns it
+run_contrast <- function(entry, name, outdir){
+  myargs    <- list(entry$expr, levels = design)
+  contrasts <- do.call(makeContrasts, myargs)
+  qlf       <- glmQLFTest(fit, contrast = contrasts)
+  top.table <- as.data.frame(topTags(qlf, n = Inf)) %>%
+    tibble::rownames_to_column("gene")
+  write.csv(top.table, paste0(outdir,"/",name,".csv"), quote = F, row.names = F)
+  row.names(top.table) <- top.table$gene
+  top.table
+}
+
+# runs a whole set and returns the list of toptables
+run_set <- function(combinations, outdir){
+  out <- list()
+  for(nm in names(combinations)){
+    cat(nm); cat("\n")
+    out[[nm]] <- run_contrast(combinations[[nm]], nm, outdir)
+  }
+  out
+}
+
+# ---- Set 1: every cytokine timepoint against the naive 0h baseline ----
+# NC is not used. All five timepoints share one reference so they are directly
+# comparable, but the cytokine effect is confounded with time in culture,
+# because naive is an uncultured 0h sample.
+combinations_naive <- list()
+for(cyt in cytokines){
+  for(tp in timepoints_all){
+    g <- paste0(cyt,"_",tp)
+    combinations_naive[[paste0(cyt,"_",tp,"_vs_Naive_0h")]] <-
+      mk(paste0(g,"-Naive_0h"), c(g,"Naive_0h"))
+  }
+}
+
+# ---- Set 2: the culture effect, then cytokine against its time-matched NC ----
+# NC vs naive isolates what culture alone does; cytokine vs NC then gives the
+# cytokine effect with that culture effect controlled for, but only at the
+# three timepoints where an NC exists.
+combinations_nc <- list()
+for(tp in timepoints_nc){
+  combinations_nc[[paste0("NC_",tp,"_vs_Naive_0h")]] <-
+    mk(paste0("NC_",tp,"-Naive_0h"), c(paste0("NC_",tp),"Naive_0h"))
+}
+for(cyt in cytokines){
+  for(tp in timepoints_nc){
+    g <- paste0(cyt,"_",tp); nc <- paste0("NC_",tp)
+    combinations_nc[[paste0(cyt,"_",tp,"_vs_NC_",tp)]] <- mk(paste0(g,"-",nc), c(g,nc))
+  }
+}
+
+# ---- Set 3: IL18 + IL36b combined, against IL2 ----
+# The two sides are the average of the two IL18/IL36b group means versus the
+# IL2 group mean at the same timepoint. Because both sides are cultured for the
+# same length of time, this needs no naive or NC reference at all - which is
+# why it is available at all five timepoints, unlike set 1.
+combinations_combo_il2 <- list()
+for(tp in timepoints_all){
+  a <- paste0("IL18_",tp); b <- paste0("IL36b_",tp); c2 <- paste0("IL2_",tp)
+  combinations_combo_il2[[paste0("IL18_IL36b_vs_IL2_",tp)]] <-
+    mk(paste0("(",a,"+",b,")/2-",c2), c(a,b,c2))
+}
+
+# ---- Set 4: IL18 + IL36b combined, against IL2 + IL7/15 combined ----
+# Same idea, but the reference is the average of the two IL2/IL715 group means.
+combinations_combo_pair <- list()
+for(tp in timepoints_all){
+  a <- paste0("IL18_",tp); b <- paste0("IL36b_",tp)
+  c2 <- paste0("IL2_",tp); d2 <- paste0("IL715_",tp)
+  combinations_combo_pair[[paste0("IL18_IL36b_vs_IL2_IL715_",tp)]] <-
+    mk(paste0("(",a,"+",b,")/2-(",c2,"+",d2,")/2"), c(a,b,c2,d2))
+}
+
+# drop any contrast whose groups are not all present, so a partial dataset still runs
+keep_available <- function(x) x[sapply(x, function(e) all(e$groups %in% colnames(design)))]
+combinations_naive      <- keep_available(combinations_naive)
+combinations_nc         <- keep_available(combinations_nc)
+combinations_combo_il2  <- keep_available(combinations_combo_il2)
+combinations_combo_pair <- keep_available(combinations_combo_pair)
+
+top_tables_naive      <- run_set(combinations_naive,      paste0(tableDir,"vs_naive"))
+top_tables_nc         <- run_set(combinations_nc,         paste0(tableDir,"vs_NC"))
+top_tables_combo_il2  <- run_set(combinations_combo_il2,  paste0(tableDir,"IL18_IL36b_vs_IL2"))
+top_tables_combo_pair <- run_set(combinations_combo_pair, paste0(tableDir,"IL18_IL36b_vs_IL2_IL715"))
+
+# all four sets in one place so the plotting chunks below can loop over them
+top_tables_sets <- list(
+  "1_vs_naive"              = top_tables_naive,
+  "2_vs_NC"                 = top_tables_nc,
+  "3_IL18_IL36b_vs_IL2"     = top_tables_combo_il2,
+  "4_IL18_IL36b_vs_IL2IL715" = top_tables_combo_pair
+)
+combinations_sets <- list(
+  "1_vs_naive"              = combinations_naive,
+  "2_vs_NC"                 = combinations_nc,
+  "3_IL18_IL36b_vs_IL2"     = combinations_combo_il2,
+  "4_IL18_IL36b_vs_IL2IL715" = combinations_combo_pair
+)
+
+# short folder names for the per-set outputs
+set_files <- c("1_vs_naive"               = "vs_naive",
+               "2_vs_NC"                  = "vs_NC",
+               "3_IL18_IL36b_vs_IL2"      = "IL18_IL36b_vs_IL2",
+               "4_IL18_IL36b_vs_IL2IL715" = "IL18_IL36b_vs_IL2_IL715")
+
+# One folder of volcanoes per set, plus a folder for the DE count barcharts.
+# 45 volcano PDFs in a single directory is unusable; split by set they are
+# straightforward to page through.
+system(paste("mkdir -p", paste0(imageDir,"DE_counts")))
+for(f in set_files){
+  system(paste("mkdir -p", paste0(imageDir,"volcanoes/",f)))
+}
+```
+
+```{r set_summary}
+# what each set contains, and which object holds it
+data.frame(
+  set = c("1: each cytokine vs Naive 0h",
+          "2: NC vs naive, then cytokine vs time-matched NC",
+          "3: IL18+IL36b vs IL2",
+          "4: IL18+IL36b vs IL2+IL715"),
+  object = c("top_tables_naive","top_tables_nc",
+             "top_tables_combo_il2","top_tables_combo_pair"),
+  n_contrasts = sapply(top_tables_sets, length)
+)
+```
+
+#### 3.2 Number of DE genes per comparison
+
+```{r de_summary, fig.width = 15, fig.height = 8}
+# counts up and down genes for every contrast across all four sets
+de_summary <- imap_dfr(top_tables_sets, function(tt, set_name){
+  imap_dfr(tt, function(tbl, comp_name){
+    tbl %>%
+      mutate(direction = case_when(
+        FDR < 0.05 & logFC >= 1  ~ "up",
+        FDR < 0.05 & logFC <= -1 ~ "down",
+        TRUE ~ "ns")) %>%
+      filter(direction != "ns") %>%
+      count(direction, name = "n_genes") %>%
+      mutate(comparison = comp_name, set = set_name)
+  })
+})
+
+# make sure a contrast with zero DE genes in both directions still gets a slot
+all_pairs <- imap_dfr(top_tables_sets, function(tt, set_name){
+  expand.grid(comparison = names(tt), direction = c("down","up"),
+              set = set_name, stringsAsFactors = FALSE)
+})
+
+de_summary <- all_pairs %>%
+  left_join(de_summary, by = c("comparison","direction","set")) %>%
+  mutate(n_genes = ifelse(is.na(n_genes), 0, n_genes),
+         signed_n = ifelse(direction == "down", -n_genes, n_genes),
+         comparison = factor(comparison, levels = unlist(lapply(top_tables_sets, names))))
+
+# the same barchart is drawn once per set and once combined, so it is defined
+# as a function rather than repeated
+plot_de_counts <- function(dat, title){
+  ggplot(dat, aes(x = comparison, y = signed_n, fill = direction)) +
+    geom_col(width = 0.75, colour = "black") +
+    geom_hline(yintercept = 0, colour = "black") +
+    scale_fill_manual(values = c("down" = "#0096FF", "up" = "#F20D0D")) +
+    labs(title = title,
+         subtitle = "FDR < 0.05, |log2FC| >= 1",
+         x = "Comparison", y = "Number of DE genes") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+}
+
+# combined overview across all four sets
+p_all <- plot_de_counts(de_summary, "Differentially expressed genes by comparison") +
+  facet_wrap(~set, scales = "free_x", nrow = 2) +
+  theme(axis.text.x = element_text(size = 7))
+p_all
+
+ggsave(paste0(imageDir,"DE_counts/DE_gene_counts_all_sets.pdf"), p_all, width = 15, height = 8)
+```
+
+##### 3.2.1 One barchart per set
+
+```{r de_summary_per_set, fig.width = 10, fig.height = 6, results = "asis"}
+# each set on its own axis, so the smaller sets are not squashed by set 1
+for(set_name in names(top_tables_sets)){
+  cat("\n\n###### Set ", set_name, "\n\n", sep="")
+  dat <- de_summary %>%
+    filter(set == set_name) %>%
+    droplevels()
+  p <- plot_de_counts(dat, paste("DE genes, set", set_name))
+  print(p)
+  ggsave(paste0(imageDir,"DE_counts/DE_gene_counts_", set_files[[set_name]], ".pdf"),
+         p, width = 10, height = 6)
+  cat("\n\n")
+}
+```
+
+##### 3.2.2 Set 1 grouped by timepoint
+
+```{r de_summary_set1_by_time, fig.width = 9, fig.height = 12}
+# The same set 1 counts, reordered: all four cytokines at 24h, then all four at
+# 48h, and so on - rather than walking one cytokine through the whole
+# timecourse before starting the next. Timepoint becomes the outer grouping,
+# so the question "does the response grow or shrink over the timecourse" reads
+# straight across the panels.
+#
+# Treatment and timepoint are taken from the contrast definitions rather than
+# parsed back out of the display names, so they cannot drift apart.
+first_group <- sapply(combinations_naive, function(e) e$groups[1])
+set1_key <- data.frame(
+  comparison = names(combinations_naive),
+  trt = sub("_.*$", "", first_group),
+  tp  = sub("^[^_]+_", "", first_group),
+  stringsAsFactors = FALSE
+)
+
+dat_s1 <- de_summary %>%
+  filter(set == "1_vs_naive") %>%
+  mutate(comparison = as.character(comparison)) %>%
+  left_join(set1_key, by = "comparison") %>%
+  mutate(trt = factor(trt, levels = cytokines),
+         tp  = factor(tp,  levels = timepoints_all))
+
+stopifnot(!any(is.na(dat_s1$trt)), !any(is.na(dat_s1$tp)))
+
+p <- ggplot(dat_s1, aes(x = trt, y = signed_n, fill = direction)) +
+  geom_col(width = 0.75, colour = "black") +
+  geom_hline(yintercept = 0, colour = "black") +
+  facet_grid(~ tp, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = c("down" = "#0096FF", "up" = "#F20D0D")) +
+  labs(title = "DE genes, set 1, grouped by timepoint",
+       subtitle = "FDR < 0.05, |log2FC| >= 1. Each panel is one timepoint; bars are the four cytokines against naive 0h",
+       x = NULL, y = "Number of DE genes") +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+        panel.spacing = grid::unit(0.6, "lines"),
+        strip.background = element_rect(fill = "grey92"),
+        panel.grid.major.x = element_blank())
+p
+
+ggsave(paste0(imageDir,"DE_counts/DE_gene_counts_set1_by_timepoint.pdf"),
+       p, width = 9, height = 12)
+```
+
+#### 3.3 Volcano plots
+
+```{r marker_genes_list, include = FALSE}
+# T-cell differentiation markers, same list used in the dane_rnaseq volcanoes
+marker_genes <- c("Batf","Nr4a1","Id3","Id2","Gzmb","Tnf","Ifng","Tcf7","Sell","Ccr7",
+                  "Slamf6","Bcl2","Bach2","Tbx21","Prdm1","Il2ra","Il2rb",
+                  "Cxcr3","Cxcr6","Pdcd1","Ctla4","Foxo1","Myb","Klrg1")
+```
+
+```{r volcanoes, fig.width = 8, fig.height = 5, results = "asis"}
+# one heading per set, then one volcano per contrast within it
+#for(set_name in names(top_tables_sets)){
+#  cat("\n\n##### Set ", set_name, "\n\n", sep="")
+#  tt <- top_tables_sets[[set_name]]
+#  for(comparison in names(tt)){
+#    cat("\n\n###### ", comparison, "\n\n", sep="")
+#    p <- plot_volcano(tt[[comparison]],
+#                      max.overlaps = 10000,
+#                      highlight_genes = marker_genes) +
+#      ggtitle(comparison)
+#    print(p)
+#    # one PDF per contrast, filed under its set
+#    ggsave(paste0(imageDir,"volcanoes/",set_files[[set_name]],"/",comparison#,".pdf"),
+#           p, width = 8, height = 5)
+#    cat("\n\n")
+#  }
+#}
+```
+
+#### 3.4 Combined DE tables
+
+```{r de_table_function, include = FALSE}
+# one wide table per set: a log2FC and an FDR column for every contrast
+make_de_table <- function(top_tables){
+  imap_dfr(top_tables, function(tbl, comp_name){
+    tbl %>%
+      filter(FDR < 0.05) %>%
+      dplyr::select(gene, logFC, FDR) %>%
+      mutate(treatment = comp_name)
+  }) %>%
+    pivot_wider(
+      id_cols = gene,
+      names_from = treatment,
+      values_from = c(logFC, FDR),
+      names_glue = "{treatment}_{.value}",
+      values_fn = dplyr::first
+    ) %>%
+    rename_with(~ gsub("logFC", "log2FC", .), everything()) %>%
+    mutate(across(contains("log2FC"), ~ round(.x, 3))) %>%
+    mutate(across(contains("FDR"), ~ signif(.x, 3)))
+}
+
+show_de_table <- function(tab){
+  if(nrow(tab) == 0) return(invisible(NULL))
+  tab <- tab[, c("gene", sort(colnames(tab)[-1]))]
+  datatable(tab, extensions = 'Buttons',
+    options = list(pageLength = 10, scrollX = TRUE, dom = 'Bfrtip',
+                   buttons = c('copy','csv','excel')))
+}
+```
+
+##### 3.4.1 Set 1, versus naive 0h
+
+```{r de_table_1, echo=FALSE}
+de_table_naive <- make_de_table(top_tables_naive)
+write.csv(de_table_naive, paste0(tableDir,"DE_table_vs_naive.csv"), row.names = FALSE)
+show_de_table(de_table_naive)
+```
+
+##### 3.4.2 Set 2, versus time-matched NC
+
+```{r de_table_2, echo=FALSE}
+de_table_nc <- make_de_table(top_tables_nc)
+write.csv(de_table_nc, paste0(tableDir,"DE_table_vs_NC.csv"), row.names = FALSE)
+show_de_table(de_table_nc)
+```
+
+##### 3.4.3 Set 3, IL18+IL36b versus IL2
+
+```{r de_table_3, echo=FALSE}
+de_table_combo_il2 <- make_de_table(top_tables_combo_il2)
+write.csv(de_table_combo_il2, paste0(tableDir,"DE_table_IL18_IL36b_vs_IL2.csv"), row.names = FALSE)
+show_de_table(de_table_combo_il2)
+```
+
+##### 3.4.4 Set 4, IL18+IL36b versus IL2+IL7/15
+
+```{r de_table_4, echo=FALSE}
+de_table_combo_pair <- make_de_table(top_tables_combo_pair)
+write.csv(de_table_combo_pair, paste0(tableDir,"DE_table_IL18_IL36b_vs_IL2_IL715.csv"), row.names = FALSE)
+show_de_table(de_table_combo_pair)
+```
+
+#### 3.5 Plotting individual genes
+
+```{r gene_plot_function, include = FALSE}
+# Expression matrix built once and reused by every gene plot below.
+# log2(CPM + 1): TMM-normalised CPM, then logged so fold changes read as equal
+# vertical distances. The +1 keeps genes with zero counts finite rather than -Inf.
+dge <- DGEList(counts = counts, group = design_matrix$group)
+dge <- calcNormFactors(dge, method = "TMM")
+count_matrix <- log2(cpm(dge, log = FALSE) + 1)
+
+# Join on the actual count column names rather than on design_matrix$label.
+# The count columns carry the _b1/_b2 batch suffix and the labels do not, so a
+# join on "label" silently produces NAs.
+sample_key <- design_matrix %>%
+  mutate(column = colnames(counts))
+
+# one panel per gene, x axis is the timecourse, one box per cytokine
+plot_genes <- function(genes, title, ncol = 3){
+  genes <- intersect(genes, rownames(count_matrix))
+  if(length(genes) == 0) return(NULL)
+
+  dt_long <- as.data.frame(count_matrix[genes, , drop = FALSE]) %>%
+    tibble::rownames_to_column("Genes") %>%
+    pivot_longer(-Genes, names_to = "column", values_to = "Expression") %>%
+    left_join(sample_key, by = "column")
+
+  stopifnot(!any(is.na(dt_long$treatment)))
+
+  # the line follows the group mean at each timepoint, the dots are the
+  # individual replicates sitting behind that mean
+  dt_mean <- dt_long %>%
+    group_by(Genes, treatment, time) %>%
+    summarise(Expression = mean(Expression), .groups = "drop")
+
+  # same dodge on both layers, otherwise the dots drift away from their line
+  pd <- position_dodge(width = 0.5)
+
+  # name each line at its own last timepoint, so the treatment can be read off
+  # the plot without going to the legend. Treatments end at different times
+  # (naive at 0h, NC at 72h, cytokines at 120h), which spreads the labels out.
+  dt_label <- dt_mean %>%
+    group_by(Genes, treatment) %>%
+    filter(as.integer(time) == max(as.integer(time))) %>%
+    ungroup()
+
+  ggplot(dt_long, aes(x = time, y = Expression, colour = treatment, group = treatment)) +
+    geom_line(data = dt_mean, linewidth = 0.7, position = pd) +
+    geom_point(size = 1.4, alpha = 0.8, position = pd) +
+    ggrepel::geom_text_repel(data = dt_label, aes(label = treatment),
+                             size = 2.5, hjust = 0, nudge_x = 0.15,
+                             direction = "y", segment.size = 0.2,
+                             min.segment.length = 0, show.legend = FALSE) +
+    facet_wrap(~Genes, ncol = ncol, scales = "free_y") +
+    scale_colour_manual(values = treatment_colours) +
+    # extra room on the right so the labels are not clipped
+    scale_x_discrete(guide = guide_axis(angle = 90),
+                     expand = expansion(mult = c(0.05, 0.22))) +
+    labs(title = title, y = "log2(CPM + 1)", x = NULL, colour = "Treatment") +
+    theme_bw()
+}
+
+# the genes that are most significant anywhere within one set, ranked by their
+# best FDR across that set's contrasts
+top_genes_for_set <- function(top_tables, n = 6){
+  imap_dfr(top_tables, function(tbl, nm) tbl %>% dplyr::select(gene, FDR)) %>%
+    group_by(gene) %>%
+    summarise(best_FDR = min(FDR), .groups = "drop") %>%
+    arrange(best_FDR) %>%
+    head(n) %>%
+    pull(gene)
+}
+
+system(paste("mkdir -p", paste0(imageDir,"genes")))
+```
+
+##### 3.5.1 Fixed marker list
+
+```{r plot_counts, fig.width = 10, fig.height = 8, warning=FALSE}
+#Select genes to plot
+genes_to_plot <- c("Batf", "Nr4a1", "Id3", "Gzmb", "Tnf", "Ifng", "Tcf7")
+
+p <- plot_genes(genes_to_plot, "Marker genes")
+p
+
+ggsave(paste0(imageDir,"genes/marker_genes.pdf"), p, width = 10, height = 8)
+```
+
+##### 3.5.2 Top genes for each set
+
+```{r plot_counts_per_set, fig.width = 10, fig.height = 8, warning=FALSE, results = "asis"}
+# Six most significant genes within each set. Every set gets its own view,
+# because the genes driving "IL18+IL36b vs IL2" are not the genes driving
+# "everything vs naive".
+n_top_genes <- 6
+
+for(set_name in names(top_tables_sets)){
+  cat("\n\n###### Set ", set_name, "\n\n", sep="")
+  genes <- top_genes_for_set(top_tables_sets[[set_name]], n = n_top_genes)
+  cat("Top genes: ", paste(genes, collapse = ", "), "\n\n", sep="")
+
+  p <- plot_genes(genes, paste("Top", n_top_genes, "genes, set", set_name))
+  if(is.null(p)){
+    cat("No genes to plot.\n\n")
+  } else {
+    print(p)
+    ggsave(paste0(imageDir,"genes/top_genes_", set_files[[set_name]], ".pdf"),
+           p, width = 10, height = 8)
+    cat("\n\n")
+  }
+}
+```
+
+#### 3.6 MHC class II module
+
+```{r mhc2_module, fig.width = 12, fig.height = 11, warning = FALSE}
+# Mouse symbols, not the human HLA-D names: H2-Aa / H2-Ab1 are I-A, H2-Eb1 is
+# I-E, H2-DMa / H2-DMb1 / H2-DMb2 are DM, H2-Oa / H2-Ob are DO. There is no
+# mouse orthologue of HLA-DP. H2-Ea is absent from this matrix, which fits a
+# C57BL/6 (H2b) background where Ea is a pseudogene.
+#
+# Cd74 is the invariant chain, Ciita the class II transactivator - the
+# inducible master switch - and Rfx5 / Rfxank / Rfxap the RFX complex, which is
+# constitutively expressed rather than induced. Nlrc5 is the class I
+# transactivator, included as a specificity control: if it moves as much as
+# Ciita then this is general antigen-presentation upregulation rather than a
+# class II specific programme.
+mhc2_module <- c("Cd74","Ciita","Rfx5","Rfxank","Rfxap",
+                 "H2-Aa","H2-Ab1","H2-Eb1",
+                 "H2-DMa","H2-DMb1","H2-DMb2",
+                 "H2-Oa","H2-Ob","Nlrc5")
+
+p <- plot_genes(mhc2_module, "MHC class II module over the timecourse", ncol = 4)
+p
+
+ggsave(paste0(imageDir,"genes/MHC_class_II_module.pdf"), p, width = 12, height = 11)
+```
+
+```{r mhc2_core, fig.width = 10, fig.height = 6, warning = FALSE}
+# the core of the module on its own, which is where the late induction sits
+p <- plot_genes(c("Cd74","Ciita","H2-Aa","H2-Eb1","Rfx5","Nlrc5"),
+                "MHC class II core: invariant chain, transactivator, class II genes",
+                ncol = 3)
+p
+
+ggsave(paste0(imageDir,"genes/MHC_class_II_core.pdf"), p, width = 10, height = 6)
+```
+
+#### 3.7 Export values for Prism
+
+```{r prism_export, warning = FALSE}
+# Expression values written out for hand-plotting in Prism. Three scales,
+# because they answer different questions:
+#   raw_count - featureCounts output after UMI deduplication, still carries
+#               library size differences
+#   cpm       - TMM-normalised counts per million, depth corrected
+#   log2cpm   - log2(CPM + 1), the scale every figure in this document uses
+# Taken from the annotated matrix before filterByExpr, so a lowly expressed
+# gene is still exported rather than silently missing.
+prism_genes <- c("Batf","Id3","Tcf7","Nr4a1","Bach2","Bcl6","Ezh2",
+                 # MHC class II module
+                 "Cd74","Ciita","Rfx5","Rfxank","Rfxap",
+                 "H2-Aa","H2-Ab1","H2-Eb1","H2-DMa","H2-DMb1","H2-DMb2",
+                 "H2-Oa","H2-Ob","Nlrc5")
+
+prism_dir <- paste0(tableDir,"prism/")
+system(paste("mkdir -p", prism_dir))
+
+# resolve case-insensitively, and say what is missing rather than failing
+found <- prism_genes[tolower(prism_genes) %in% tolower(rownames(counts))]
+missing_genes <- setdiff(prism_genes, found)
+if(length(missing_genes) > 0){
+  cat("NOT FOUND in the matrix:", paste(missing_genes, collapse = ", "), "\n")
+}
+idx <- match(tolower(found), tolower(rownames(counts)))
+
+cpm_mat  <- cpm(dge, log = FALSE)
+lcpm_mat <- log2(cpm_mat + 1)
+
+# ---- long format: one row per gene x sample, all metadata attached ----
+long <- do.call(rbind, lapply(seq_along(found), function(i){
+  r <- idx[i]
+  data.frame(
+    gene      = found[i],
+    sample    = sample_key$sample_name,
+    label     = sample_key$label,
+    treatment = as.character(sample_key$treatment),
+    time      = as.character(sample_key$time),
+    replicate = sample_key$replicate,
+    batch     = sample_key$batch,
+    raw_count = as.numeric(counts[r, ]),
+    cpm       = round(as.numeric(cpm_mat[r, ]), 3),
+    log2cpm   = round(as.numeric(lcpm_mat[r, ]), 4),
+    stringsAsFactors = FALSE
+  )
+}))
+
+write.csv(long, paste0(prism_dir,"gene_values_long.csv"), row.names = FALSE)
+```
+
+```{r prism_export_wide, warning = FALSE}
+# ---- wide format, one file per gene per scale ----
+# Rows are timepoints, columns are treatment_repN. That is the shape a Prism
+# Grouped table expects: paste it in, then group the replicate columns.
+# Empty cells are real gaps in the design (naive exists only at 0h, NC stops
+# at 72h, IL715_24h has two replicates), so they are written as blanks.
+time_levels <- levels(design_matrix$time)
+trt_levels  <- levels(design_matrix$treatment)
+
+make_wide <- function(dat, value_col){
+  dat$col <- paste0(dat$treatment, "_rep", dat$replicate)
+
+  col_order <- unlist(lapply(trt_levels, function(t){
+    reps <- sort(unique(dat$replicate[dat$treatment == t]))
+    if(length(reps) == 0) return(NULL)
+    paste0(t, "_rep", reps)
+  }))
+
+  w <- dat %>%
+    dplyr::select(time, col, value = dplyr::all_of(value_col)) %>%
+    pivot_wider(names_from = col, values_from = value) %>%
+    mutate(time = factor(time, levels = time_levels)) %>%
+    arrange(time)
+
+  w[, c("time", intersect(col_order, colnames(w))), drop = FALSE]
+}
+
+for(g in found){
+  d <- long %>% filter(gene == g)
+  write.csv(make_wide(d, "log2cpm"),
+            paste0(prism_dir, g, "_log2cpm_wide.csv"), row.names = FALSE, na = "")
+  write.csv(make_wide(d, "raw_count"),
+            paste0(prism_dir, g, "_rawcount_wide.csv"), row.names = FALSE, na = "")
+}
+
+cat("genes exported:", paste(found, collapse = ", "), "\n")
+cat("files written to:", prism_dir, "\n\n")
+print(list.files(prism_dir))
+```
+
+### 4. Pathway analysis
+
+```{r pathway_functions, include = FALSE}
+#get the hallmarks database
+h_gene_sets = msigdbr(species = "mouse", category = "H")
+local_gene_sets_df <- h_gene_sets %>%
+  dplyr::select(gs_name, gene_symbol)
+
+# run enrichment separately on the up and down gene lists of each contrast,
+# returning NULL when a list is too short to test
+run_enrichment <- function(genes, direction_label, treatment_label, min_size = 5){
+  genes <- unique(na.omit(genes))
+  if(length(genes) < min_size) return(NULL)
+
+  enr <- clusterProfiler::enricher(gene = genes,
+                                   TERM2GENE = local_gene_sets_df,
+                                   pAdjustMethod = "BH")
+  if(is.null(enr)) return(NULL)
+  res <- as.data.frame(enr)
+  if(nrow(res) == 0) return(NULL)
+
+  res %>%
+    mutate(direction = direction_label, treatment = treatment_label)
+}
+
+# runs the above across every contrast of one set and collates the result
+enrich_set <- function(top_tables, combinations){
+  results <- list()
+  for(combination in names(top_tables)){
+    tbl <- top_tables[[combination]]
+    up   <- tbl %>% filter(FDR < 0.05, logFC >= 1)  %>% pull(gene)
+    down <- tbl %>% filter(FDR < 0.05, logFC <= -1) %>% pull(gene)
+
+    results[[paste0(combination,"_up")]]   <- run_enrichment(up,   "Upregulated",   combination)
+    results[[paste0(combination,"_down")]] <- run_enrichment(down, "Downregulated", combination)
+  }
+
+  collated <- bind_rows(results)
+  if(nrow(collated) == 0) return(collated)
+
+  collated %>%
+    mutate(pathway = gsub("HALLMARK_", "", ID)) %>%
+    mutate(
+      treatment = forcats::fct_relevel(treatment, names(combinations)),
+      pathway = fct_rev(fct_relevel(pathway, sort(unique(pathway))))
+    ) %>%
+    filter(p.adjust < 0.05)
+}
+
+plot_enrichment <- function(collated, title){
+  if(nrow(collated) == 0) return(NULL)
+  collated %>%
+    ggplot(aes(treatment, pathway, size = FoldEnrichment)) +
+    geom_point(aes(color = direction)) +
+    facet_wrap(~direction, nrow = 1) +
+    scale_color_manual(values = c("Upregulated" = "firebrick",
+                                  "Downregulated" = "steelblue")) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+          strip.text = element_text(size = 8, face = "bold"),
+          legend.position = "right") +
+    labs(title = title, x = "Treatment", y = "Pathway")
+}
+
+show_enrichment_table <- function(collated){
+  if(nrow(collated) == 0) return(invisible(NULL))
+  datatable(
+    collated %>%
+      dplyr::select(treatment, direction, pathway, GeneRatio, BgRatio, p.adjust, Count) %>%
+      mutate(p.adjust = signif(p.adjust, 3)) %>%
+      arrange(p.adjust),
+    extensions = 'Buttons',
+    options = list(pageLength = 15, scrollX = TRUE, dom = 'Bfrtip',
+                   buttons = c('copy','csv','excel')))
+}
+```
+
+```{r pathway_run, include = FALSE}
+# enrichment for all four sets, kept in one named list
+collated_sets <- list()
+for(set_name in names(top_tables_sets)){
+  collated_sets[[set_name]] <- enrich_set(top_tables_sets[[set_name]],
+                                          combinations_sets[[set_name]])
+  write.csv(collated_sets[[set_name]],
+            paste0(tableDir,"hallmark_enrichment_", set_files[[set_name]], ".csv"),
+            row.names = FALSE)
+}
+```
+
+```{r pathway_plots, fig.width = 12, fig.height = 11, warning=FALSE, results = "asis"}
+for(set_name in names(collated_sets)){
+  cat("\n\n#### Set ", set_name, "\n\n", sep="")
+  p <- plot_enrichment(collated_sets[[set_name]], paste("Hallmark enrichment, set", set_name))
+  if(is.null(p)){
+    cat("No hallmark sets reached significance in this set.\n\n")
+  } else {
+    print(p)
+    ggsave(paste0(imageDir,"hallmark_enrichment_", set_files[[set_name]], ".pdf"),
+           p, width = 12, height = 11)
+    cat("\n\n")
+  }
+}
+```
+
+#### 4.5 Enrichment tables
+
+##### 4.5.1 Set 1
+
+```{r enrich_table_1, echo=FALSE}
+show_enrichment_table(collated_sets[["1_vs_naive"]])
+```
+
+##### 4.5.2 Set 2
+
+```{r enrich_table_2, echo=FALSE}
+show_enrichment_table(collated_sets[["2_vs_NC"]])
+```
+
+##### 4.5.3 Set 3
+
+```{r enrich_table_3, echo=FALSE}
+show_enrichment_table(collated_sets[["3_IL18_IL36b_vs_IL2"]])
+```
+
+##### 4.5.4 Set 4
+
+```{r enrich_table_4, echo=FALSE}
+show_enrichment_table(collated_sets[["4_IL18_IL36b_vs_IL2IL715"]])
+```
+
+### 5. Transcription factor activity (DoRothEA)
+
+```{r dorothea_setup, warning = FALSE}
+library(decoupleR)
+library(dorothea)
+
+# DoRothEA mouse regulons at confidence A-C. This data ships inside the package
+# so it works offline; CollecTRI via decoupleR::get_collectri() is the newer
+# alternative but needs a live call out to OmnipathR.
+data(dorothea_mm, package = "dorothea")
+
+regulons <- dorothea_mm %>%
+  filter(confidence %in% c("A","B","C")) %>%
+  dplyr::select(source = tf, target, mor)
+
+cat("TFs:", length(unique(regulons$source)), " edges:", nrow(regulons), "\n")
+```
+
+```{r tf_functions, include = FALSE}
+# One signed statistic per gene per contrast. edgeR's quasi-likelihood test
+# reports F, which has no direction, so it is signed by the fold change:
+# sign(logFC) * sqrt(F) is monotone in the p-value and keeps direction. Using
+# this rather than logFC alone means a large but noisy fold change does not
+# outweigh a smaller, well-supported one.
+make_stat_matrix <- function(top_tables){
+  m <- imap_dfr(top_tables, function(tbl, nm){
+    tbl %>% transmute(gene, contrast = nm, stat = sign(logFC) * sqrt(.data[["F"]]))
+  }) %>%
+    pivot_wider(names_from = contrast, values_from = stat, values_fn = dplyr::first) %>%
+    tibble::column_to_rownames("gene") %>%
+    as.matrix()
+  # a gene missing from any contrast would propagate NAs through the model
+  m[complete.cases(m), , drop = FALSE]
+}
+
+run_tf_activity <- function(top_tables){
+  decoupleR::run_ulm(mat = make_stat_matrix(top_tables),
+                     network = regulons, minsize = 5)
+}
+
+# The question "which TFs are most influencing this timepoint" answered
+# directly: one row per contrast, columns are ranks 1..n, cells are the TF and
+# its activity score. Rendered with kable rather than a DT widget because four
+# sets of DT tables would add several MB to the document for no extra use.
+top_tf_table <- function(tf_acts, contrast_order, n = 10){
+  tf_acts %>%
+    mutate(condition = factor(condition, levels = contrast_order)) %>%
+    group_by(condition) %>%
+    slice_max(abs(score), n = n, with_ties = FALSE) %>%
+    mutate(rank  = row_number(),
+           entry = paste0(source, " (", round(score, 1), ")")) %>%
+    ungroup() %>%
+    dplyr::select(condition, rank, entry) %>%
+    pivot_wider(names_from = rank, values_from = entry, names_prefix = "") %>%
+    arrange(condition) %>%
+    dplyr::rename(contrast = condition)
+}
+
+tf_heatmap <- function(tf_acts, contrast_order, title, file, n_tf = 30){
+  top_tfs <- tf_acts %>%
+    group_by(source) %>%
+    summarise(max_abs = max(abs(score)), .groups = "drop") %>%
+    arrange(desc(max_abs)) %>% head(n_tf) %>% pull(source)
+
+  m <- tf_acts %>%
+    filter(source %in% top_tfs) %>%
+    dplyr::select(source, condition, score) %>%
+    pivot_wider(names_from = condition, values_from = score) %>%
+    tibble::column_to_rownames("source") %>%
+    as.matrix()
+
+  # keep contrasts in the order the set defines them, not alphabetical
+  m <- m[, intersect(contrast_order, colnames(m)), drop = FALSE]
+
+  # diverging scale centred on zero: blue = less active, red = more active
+  lim <- max(abs(m), na.rm = TRUE)
+  br  <- seq(-lim, lim, length.out = 101)
+  col <- colorRampPalette(c("#0096FF","white","#F20D0D"))(100)
+
+  pheatmap(m, color = col, breaks = br, cluster_cols = FALSE, cluster_rows = TRUE,
+           fontsize_row = 8, fontsize_col = 8, main = title,
+           filename = paste0(imageDir, file), width = 12, height = 10)
+  pheatmap(m, color = col, breaks = br, cluster_cols = FALSE, cluster_rows = TRUE,
+           fontsize_row = 8, fontsize_col = 8, main = title)
+}
+```
+
+```{r tf_run_all, include = FALSE}
+# every set gets its own TF activity, written out in full to CSV
+tf_acts_sets <- list()
+for(set_name in names(top_tables_sets)){
+  tf_acts_sets[[set_name]] <- run_tf_activity(top_tables_sets[[set_name]])
+  write.csv(tf_acts_sets[[set_name]],
+            paste0(tableDir,"TF_activity_dorothea_", set_files[[set_name]], ".csv"),
+            row.names = FALSE)
+}
+```
+
+#### 5.1 Top TFs per contrast
+
+```{r tf_tables, results = "asis"}
+# one table per set: for each contrast, the ten TFs with the largest absolute
+# activity score, in rank order
+for(set_name in names(tf_acts_sets)){
+  cat("\n\n##### Set ", set_name, "\n\n", sep="")
+  tab <- top_tf_table(tf_acts_sets[[set_name]], names(top_tables_sets[[set_name]]), n = 10)
+  print(knitr::kable(tab, format = "html", escape = FALSE))
+  cat("\n\n")
+}
+```
+
+#### 5.2 Activity heatmaps
+
+```{r tf_heatmaps, fig.width = 12, fig.height = 10, results = "asis"}
+for(set_name in names(tf_acts_sets)){
+  cat("\n\n##### Set ", set_name, "\n\n", sep="")
+  tf_heatmap(tf_acts_sets[[set_name]],
+             names(top_tables_sets[[set_name]]),
+             paste("DoRothEA TF activity, set", set_name),
+             paste0("TF_activity_dorothea_", set_files[[set_name]], ".pdf"))
+  cat("\n\n")
+}
+```
+
+#### 5.3 Batf across all sets
+
+```{r tf_batf, fig.width = 12, fig.height = 8}
+# Batf specifically. Activity here is inferred from Batf's targets, so it is a
+# different quantity from Batf's own expression - the two are worth comparing
+# against the line plots in section 3.5.
+batf_all <- imap_dfr(tf_acts_sets, function(x, set_name){
+  x %>% filter(tolower(source) == "batf") %>% mutate(set = set_name)
+})
+
+if(nrow(batf_all) == 0){
+  cat("Batf is not present in the DoRothEA A-C regulons.\n")
+} else {
+  batf_all <- batf_all %>%
+    mutate(condition = factor(condition, levels = unlist(lapply(top_tables_sets, names))))
+
+  p <- ggplot(batf_all, aes(x = condition, y = score, fill = score > 0)) +
+    geom_col(colour = "black", width = 0.7) +
+    geom_hline(yintercept = 0) +
+    facet_wrap(~set, scales = "free_x", nrow = 2) +
+    scale_fill_manual(values = c("TRUE" = "#F20D0D", "FALSE" = "#0096FF"), guide = "none") +
+    labs(title = "Batf inferred activity across all four contrast sets",
+         subtitle = "ULM score from DoRothEA A-C targets",
+         x = NULL, y = "Activity score") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7))
+  p
+  ggsave(paste0(imageDir,"TF_activity_Batf_all_sets.pdf"), p, width = 12, height = 8)
+}
+```
+
+#### 5.4 Differential programmes
+
+```{r tf_programmes, fig.width = 11, fig.height = 15, results = "asis"}
+# TFs grouped into the programmes they belong to, for the two cytokine-versus-
+# cytokine sets. Both sides are time-matched here, so a score is a statement
+# about the cytokines rather than about time in culture.
+#
+# SIGN CONVENTION: positive (red) = higher in the IL18 + IL36b arm,
+#                  negative (blue) = higher in the IL2 / IL7-15 arm.
+# MAPK has no TF of its own - it acts through the transcription factors that
+# ERK, JNK and p38 phosphorylate. Two blocks: the AP-1 dimers (JNK/ERK), and
+# the ternary-complex / immediate-early / CREB arm (ERK / p38). Cebpb is a p38
+# target and sits with the latter. Batf appears here AND under T cell fate; the
+# join below gives it a row in each facet.
+programmes <- list(
+  "NF-kB"           = c("Rela","Rel","Nfkb1","Nfkb2","Relb"),
+  "MAPK: AP-1"      = c("Jun","Junb","Jund","Fos","Fosl1","Fosl2","Atf2","Atf3","Batf"),
+  "MAPK: ETS/EGR/CREB" = c("Elk1","Ets1","Ets2","Srf","Egr1","Creb1","Atf4","Cebpb"),
+  "JAK-STAT"        = c("Stat1","Stat3","Stat4","Stat5a","Stat5b","Stat6"),
+  "Proliferation"   = c("Myc","Mycn","E2f1","E2f4","Foxm1","Tfdp1"),
+  "MHC class II"    = c("Rfx5","Rfxank","Rfxap","Ciita"),
+  "T cell fate"     = c("Tbx21","Irf4","Batf","Prdm1","Tcf7")
+)
+
+prog_key <- data.frame(
+  source    = unlist(programmes, use.names = FALSE),
+  programme = rep(names(programmes), lengths(programmes)),
+  stringsAsFactors = FALSE
+)
+
+programme_sets <- c("3_IL18_IL36b_vs_IL2", "4_IL18_IL36b_vs_IL2IL715")
+
+for(set_name in programme_sets){
+  cat("\n\n##### Set ", set_name, "\n\n", sep="")
+
+  d <- tf_acts_sets[[set_name]] %>%
+    filter(source %in% prog_key$source) %>%
+    # sets 3 and 4 name their contrasts ..._<timepoint>, so the timepoint can
+    # be taken off the end. Sets 1 and 2 do not, which is why they are excluded.
+    mutate(tp = factor(sub("^.*_([0-9]+h)$", "\\1", condition),
+                       levels = timepoints_all)) %>%
+    left_join(prog_key, by = "source") %>%
+    mutate(programme = factor(programme, levels = names(programmes)))
+
+  lim <- max(abs(d$score), na.rm = TRUE)
+
+  p <- ggplot(d, aes(x = tp, y = source, fill = score)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = round(score, 1)), size = 2.6, colour = "grey15") +
+    facet_grid(programme ~ ., scales = "free_y", space = "free_y") +
+    scale_fill_gradient2(low = "#0096FF", mid = "white", high = "#F20D0D",
+                         midpoint = 0, limits = c(-lim, lim)) +
+    labs(title = paste("Differential programmes, set", set_name),
+         subtitle = "Red = higher in IL18 + IL36b; blue = higher in IL2 / IL7-15",
+         x = NULL, y = NULL, fill = "ULM score") +
+    theme_minimal(base_size = 11) +
+    theme(panel.grid = element_blank(),
+          strip.text.y = element_text(angle = 0, face = "bold"))
+  print(p)
+
+  ggsave(paste0(imageDir,"TF_programmes_", set_files[[set_name]], ".pdf"),
+         p, width = 11, height = 10)
+  cat("\n\n")
+}
+```
+
+#### 5.5 Per-cytokine TF activity trajectories
+
+```{r tf_sample_activity, include = FALSE}
+# Everything above scores CONTRASTS. This scores SAMPLES, which is what lets
+# each treatment - NC included - have a trajectory of its own rather than only
+# appearing as the thing being subtracted.
+#
+# Genes are z-scaled across samples first. Without that, the score is dominated
+# by how highly a TF's targets are expressed in absolute terms, which is the
+# same in every sample and tells you nothing. After scaling, a score says how
+# active a TF looks in that sample relative to the average sample, so 0 means
+# average rather than "no change versus a control".
+mat_z <- count_matrix[apply(count_matrix, 1, sd) > 0, , drop = FALSE]
+mat_z <- t(scale(t(mat_z)))
+
+tf_sample <- decoupleR::run_ulm(mat = mat_z, network = regulons, minsize = 5) %>%
+  left_join(sample_key %>% dplyr::select(column, treatment, time, replicate, batch),
+            by = c("condition" = "column"))
+
+stopifnot(!any(is.na(tf_sample$treatment)))
+
+write.csv(tf_sample, paste0(tableDir,"TF_activity_per_sample.csv"), row.names = FALSE)
+cat("TFs scored per sample:", length(unique(tf_sample$source)),
+    " samples:", length(unique(tf_sample$condition)), "\n")
+```
+
+```{r tf_trajectories, fig.width = 13, fig.height = 8}
+# NF-kB arm (Rela, Rel), Cebpb, the gamma-c STAT arm (Stat5a, Stat5b), Myc,
+# and Rfx5. One panel per TF, one line per treatment, so convergence between
+# cytokines is visible directly: if IL18 and IL36b track each other on Rela and
+# Cebpb while IL2 and IL715 track each other on Stat5 and Myc, that is two
+# distinct states rather than one axis of activation strength.
+tf_traj <- c("Rela","Rel","Cebpb","Stat5a","Stat5b","Myc","Rfx5")
+
+d <- tf_sample %>%
+  filter(source %in% tf_traj) %>%
+  mutate(source = factor(source, levels = tf_traj))
+
+d_mean <- d %>%
+  group_by(source, treatment, time) %>%
+  summarise(score = mean(score), .groups = "drop")
+
+# name each line at its own final timepoint
+d_lab <- d_mean %>%
+  group_by(source, treatment) %>%
+  filter(as.integer(time) == max(as.integer(time))) %>%
+  ungroup()
+
+pd <- position_dodge(width = 0.5)
+
+p <- ggplot(d, aes(x = time, y = score, colour = treatment, group = treatment)) +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed") +
+  geom_line(data = d_mean, linewidth = 0.7, position = pd) +
+  geom_point(size = 1.3, alpha = 0.8, position = pd) +
+  ggrepel::geom_text_repel(data = d_lab, aes(label = treatment), size = 2.4,
+                           hjust = 0, nudge_x = 0.15, direction = "y",
+                           segment.size = 0.2, min.segment.length = 0,
+                           show.legend = FALSE) +
+  facet_wrap(~source, ncol = 4, scales = "free_y") +
+  scale_colour_manual(values = treatment_colours) +
+  scale_x_discrete(guide = guide_axis(angle = 90),
+                   expand = expansion(mult = c(0.05, 0.25))) +
+  labs(title = "TF activity trajectories, one line per treatment",
+       subtitle = "Per-sample ULM score on gene-wise z-scaled log2(CPM+1). 0 = average sample, dashed line",
+       x = NULL, y = "TF activity (ULM score)", colour = "Treatment") +
+  theme_bw(base_size = 11)
+p
+
+ggsave(paste0(imageDir,"TF_trajectories_per_cytokine.pdf"), p, width = 13, height = 8)
+```
+
+```{r tf_trajectories_mapk, fig.width = 13, fig.height = 8}
+# The MAPK effectors as per-treatment trajectories. Jun / Junb / Fos are the
+# AP-1 core and Batf its T-cell partner, so if IL18 and IL36b drive AP-1 the
+# four should move together under those two and not under IL2 / IL7-15. Egr1
+# and Elk1 report ERK directly; Ets1 and Creb1 are the broader ERK / p38 arm.
+tf_traj_mapk <- c("Jun","Junb","Fos","Batf","Egr1","Elk1","Ets1","Creb1")
+
+d <- tf_sample %>%
+  filter(source %in% tf_traj_mapk) %>%
+  mutate(source = factor(source, levels = tf_traj_mapk))
+
+d_mean <- d %>% group_by(source, treatment, time) %>%
+  summarise(score = mean(score), .groups = "drop")
+d_lab <- d_mean %>% group_by(source, treatment) %>%
+  filter(as.integer(time) == max(as.integer(time))) %>% ungroup()
+
+p <- ggplot(d, aes(x = time, y = score, colour = treatment, group = treatment)) +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed") +
+  geom_line(data = d_mean, linewidth = 0.7, position = pd) +
+  geom_point(size = 1.3, alpha = 0.8, position = pd) +
+  ggrepel::geom_text_repel(data = d_lab, aes(label = treatment), size = 2.4,
+                           hjust = 0, nudge_x = 0.15, direction = "y",
+                           segment.size = 0.2, min.segment.length = 0, show.legend = FALSE) +
+  facet_wrap(~source, ncol = 4, scales = "free_y") +
+  scale_colour_manual(values = treatment_colours) +
+  scale_x_discrete(guide = guide_axis(angle = 90), expand = expansion(mult = c(0.05, 0.25))) +
+  labs(title = "MAPK effector TF activity, one line per treatment",
+       subtitle = "Per-sample ULM score on gene-wise z-scaled log2(CPM+1). 0 = average sample",
+       x = NULL, y = "TF activity (ULM score)", colour = "Treatment") +
+  theme_bw(base_size = 11)
+p
+
+ggsave(paste0(imageDir,"TF_trajectories_MAPK.pdf"), p, width = 13, height = 8)
+```
+
+#### 5.6 The MHC-II versus JAK-STAT dichotomy
+
+```{r signature_scores, warning = FALSE}
+# TF activity is inference from a regulon; this is the direct measurement.
+# Two signatures, scored per sample:
+#
+#   MHC class II - curated mouse module. No Hallmark set covers class II
+#     specifically, and the human HLA-D names do not exist in mouse, so this is
+#     assembled by hand: invariant chain, transactivator and the H2 loci.
+#   IL2/STAT5    - HALLMARK_IL2_STAT5_SIGNALING, the standard gamma-c readout,
+#     taken from the mouse msigdbr collection already loaded in section 4.
+#
+# Scoring is the mean gene-wise z-score across the signature, reusing the same
+# scaled matrix as the per-sample TF activity. So 0 is the average sample and
+# the two signatures are on a common scale, which is what makes them plottable
+# against each other.
+mhc2_sig  <- c("Cd74","Ciita","H2-Aa","H2-Ab1","H2-Eb1",
+               "H2-DMa","H2-DMb1","H2-DMb2","H2-Oa","H2-Ob")
+stat5_sig <- h_gene_sets %>%
+  filter(gs_name == "HALLMARK_IL2_STAT5_SIGNALING") %>%
+  pull(gene_symbol) %>% unique()
+
+score_signature <- function(genes){
+  g <- intersect(genes, rownames(mat_z))
+  if(length(g) < 3) stop("too few signature genes found")
+  colMeans(mat_z[g, , drop = FALSE])
+}
+
+cat("MHC class II genes found :", length(intersect(mhc2_sig,  rownames(mat_z))), "of", length(mhc2_sig),  "\n")
+cat("IL2/STAT5 genes found    :", length(intersect(stat5_sig, rownames(mat_z))), "of", length(stat5_sig), "\n")
+
+sig_df <- sample_key %>%
+  mutate(`MHC class II` = score_signature(mhc2_sig),
+         `IL2/STAT5`    = score_signature(stat5_sig))
+
+write.csv(sig_df %>% dplyr::select(sample_name, treatment, time, replicate,
+                                   `MHC class II`, `IL2/STAT5`),
+          paste0(tableDir,"signature_scores.csv"), row.names = FALSE)
+```
+
+```{r signature_figure, fig.width = 14, fig.height = 6.5, warning = FALSE}
+# --- left: each signature as a trajectory per treatment ---
+sig_long <- sig_df %>%
+  pivot_longer(c(`MHC class II`, `IL2/STAT5`),
+               names_to = "signature", values_to = "score")
+
+sig_mean <- sig_long %>%
+  group_by(signature, treatment, time) %>%
+  summarise(score = mean(score), .groups = "drop")
+
+sig_lab <- sig_mean %>%
+  group_by(signature, treatment) %>%
+  filter(as.integer(time) == max(as.integer(time))) %>% ungroup()
+
+pd <- position_dodge(width = 0.5)
+
+p1 <- ggplot(sig_long, aes(x = time, y = score, colour = treatment, group = treatment)) +
+  geom_hline(yintercept = 0, colour = "grey70", linetype = "dashed") +
+  geom_line(data = sig_mean, linewidth = 0.8, position = pd) +
+  geom_point(size = 1.3, alpha = 0.8, position = pd) +
+  ggrepel::geom_text_repel(data = sig_lab, aes(label = treatment), size = 2.5,
+                           hjust = 0, nudge_x = 0.15, direction = "y",
+                           segment.size = 0.2, min.segment.length = 0,
+                           show.legend = FALSE) +
+  facet_wrap(~signature, ncol = 1, scales = "free_y") +
+  scale_colour_manual(values = treatment_colours) +
+  scale_x_discrete(guide = guide_axis(angle = 90),
+                   expand = expansion(mult = c(0.05, 0.25))) +
+  labs(x = NULL, y = "Signature score (mean z)", colour = "Treatment") +
+  theme_bw(base_size = 11)
+
+# --- right: the two signatures against each other, as a state space ---
+# If the dichotomy is real, the two arms leave the origin along different axes
+# rather than along the same one.
+sig_wide_mean <- sig_df %>%
+  group_by(treatment, time) %>%
+  summarise(`MHC class II` = mean(`MHC class II`),
+            `IL2/STAT5`    = mean(`IL2/STAT5`), .groups = "drop") %>%
+  arrange(treatment, time)
+
+p2 <- ggplot(sig_df, aes(x = `IL2/STAT5`, y = `MHC class II`, colour = treatment)) +
+  geom_hline(yintercept = 0, colour = "grey85") +
+  geom_vline(xintercept = 0, colour = "grey85") +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_path(data = sig_wide_mean, aes(group = treatment), linewidth = 0.8,
+            arrow = grid::arrow(length = grid::unit(0.16, "cm"), type = "closed")) +
+  ggrepel::geom_text_repel(data = sig_wide_mean, aes(label = gsub("h","",time)),
+                           size = 2.4, show.legend = FALSE, max.overlaps = Inf) +
+  scale_colour_manual(values = treatment_colours) +
+  labs(title = NULL, x = "IL2/STAT5 signature", y = "MHC class II signature",
+       colour = "Treatment") +
+  theme_bw(base_size = 11)
+
+p <- (p1 | p2) +
+  patchwork::plot_annotation(
+    title = "MHC class II versus IL2/STAT5 programmes",
+    subtitle = "Mean gene-wise z-score per sample. Left: each signature over time. Right: the two against each other, arrows follow the timecourse, numbers are hours"
+  )
+p
+
+ggsave(paste0(imageDir,"signature_MHCII_vs_STAT5.pdf"), p, width = 14, height = 6.5)
+```
+
+### 6. Session info
+
+```{r session_info}
+sessionInfo()
+```
+
+##### Publisher export: MDS without NC
+
+```{r mds_no_nc_publisher, fig.width = 9, fig.height = 7}
+# Recompute the MDS after removing NC, rather than simply hiding NC points from
+# an ordination fitted to all samples.
+keep_no_nc <- design_matrix$treatment != "NC"
+
+dm_mds <- design_matrix[keep_no_nc, , drop = FALSE]
+cnt_mds <- counts[, keep_no_nc, drop = FALSE]
+
+group_mds <- factor(dm_mds$group)
+y_mds <- DGEList(counts = cnt_mds, group = group_mds)
+keep_genes_mds <- filterByExpr(y_mds, group = group_mds)
+y_mds <- y_mds[keep_genes_mds, , keep.lib.sizes = FALSE]
+y_mds <- calcNormFactors(y_mds)
+
+mds_no_nc <- plotMDS(y_mds, top = 1000, plot = FALSE)
+
+mds_no_nc_df <- dm_mds %>%
+  mutate(
+    MDS1 = mds_no_nc$x,
+    MDS2 = mds_no_nc$y
+  )
+
+# All samples use circles; colour identifies treatment.
+p_mds_no_nc <- ggplot(
+  mds_no_nc_df,
+  aes(x = MDS1, y = MDS2, colour = treatment, label = label)
+) +
+  geom_point(size = 3, shape = 16) +
+  ggrepel::geom_text_repel(
+    size = 2.5,
+    max.overlaps = 30,
+    show.legend = FALSE
+  ) +
+  scale_colour_manual(values = treatment_colours) +
+  labs(
+    title = "MDS plot, NC excluded",
+    x = "Dimension 1",
+    y = "Dimension 2",
+    colour = "Treatment"
+  ) +
+  theme_minimal(base_size = 12)
+
+p_mds_no_nc
+
+ggsave(
+  paste0(imageDir, "MDS_plot_no_NC.pdf"),
+  p_mds_no_nc, width = 9, height = 7
+)
+
+ggsave(
+  paste0(imageDir, "MDS_plot_no_NC.svg"),
+  p_mds_no_nc, width = 9, height = 7,
+  device = "svg"
+)
+```

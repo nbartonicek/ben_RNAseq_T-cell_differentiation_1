@@ -1,0 +1,640 @@
+---
+title: "Cytokine-driven T-cell differentiation timecourse"
+output:
+  rmarkdown::html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 5
+vignette: >
+  %\VignetteIndexEntry{ben_legg_cytokine_timecourse}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+  %\VignetteBuild{true}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+### 1. Workplace setup
+
+```{r setup, warning = FALSE, include = FALSE}
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(stringr)
+library(purrr)
+library(forcats)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(edgeR)
+library(org.Mm.eg.db)
+library(msigdbr)
+library(clusterProfiler)
+library(pheatmap)
+library(DT)
+library(patchwork)
+```
+
+#### 1.1 Directory structure
+
+```{r directory_setup, warning = FALSE, echo=F}
+# 1. make sure the bioinf_scratch drive is mounted
+# 2. session -> set working directory -> scripts
+
+######## directory structure #######
+projectDir=paste0("../")
+resultsDir=paste0(projectDir,"/results")
+imageDir=paste0(resultsDir,"/figures/")
+robjectsDir = paste(resultsDir,"/Robjects/",sep="")
+tableDir = paste(resultsDir,"/tables/",sep="")
+
+system(paste("mkdir -p",robjectsDir))
+system(paste("mkdir -p",tableDir))
+system(paste("mkdir -p",imageDir))
+
+# counts come from 5.feature_counts.sbatch, one file per sample
+inDir<-paste0(resultsDir,"/counts/featurecounts/")
+```
+
+#### 1.2 Experimental design
+
+Naive T-cells cultured with one of four cytokines across a timecourse, against
+a negative control (NC) and an uncultured naive baseline.
+
+1. **NC only exists at 24h, 48h and 72h.** The 96h and 120h cytokine samples
+   have no time-matched control. 
+2. **IL36b_96h is entirely batch 2.** All three of its replicates were
+   resequenced in the `GMP5RJ` batch, along with IL2_96h rep 3. 
+
+
+
+```{r colours, warning = FALSE, echo=F}
+# IL2 / IL7_15 / IL36 keep the same colours used in the dane_rnaseq analysis so
+# the two Ben projects can be read side by side. IL18 is new here and takes
+# orange. Naive and NC are greys, because they are references rather than
+# treatments of interest.
+treatment_colours <- c(
+  "Naive" = "gray70",
+  "NC"    = "gray40",
+  "IL2"   = "#F20D0D",
+  "IL715" = "#00B050",
+  "IL18"  = "#FF8C00",
+  "IL36b" = "#0096FF"
+)
+
+# Direction colours, shared by the volcanoes and the pathway dotplot.
+direction_colours <- c(
+  "DOWN" = "#0096FF",
+  "NO"   = "gray60",
+  "UP"   = "#F20D0D"
+)
+```
+
+```{r volcano_function, include = FALSE, echo=F}
+# Same volcano used in 8.ben_volcanoes.Rmd. Pass highlight_genes to label a
+# fixed marker list instead of every significant gene.
+plot_volcano <- function(top,
+                         FDR_cutoff = 0.05,
+                         max.overlaps = 30,
+                         highlight_genes = NULL) {
+  top <- as.data.frame(top)
+
+  # Rename column if needed
+  if ("adj.P.Val" %in% colnames(top)) {
+    top <- top %>%
+      rename(FDR = adj.P.Val)
+  }
+
+  # Differential expression flags. Built with ifelse rather than by indexing
+  # into a subset, so a contrast with no significant genes does not error.
+  top$diff_expression <- "NO"
+  top$diff_expression[top$logFC >= 1  & top$FDR <= FDR_cutoff] <- "UP"
+  top$diff_expression[top$logFC <= -1 & top$FDR <= FDR_cutoff] <- "DOWN"
+
+  # Label logic
+  top$labelgenes <- ""
+  if (!is.null(highlight_genes)) {
+    highlight_genes_present <- intersect(highlight_genes, rownames(top))
+    top[rownames(top) %in% highlight_genes_present, "labelgenes"] <-
+      rownames(top)[rownames(top) %in% highlight_genes_present]
+  } else {
+    top[top$diff_expression != "NO", "labelgenes"] <-
+      rownames(top[top$diff_expression != "NO", ])
+  }
+
+  ggplot(top, aes(x = logFC, y = -log10(FDR), color = diff_expression, label = labelgenes)) +
+    geom_point(size = 1.8) +
+    geom_text_repel(
+      max.overlaps = max.overlaps,
+      min.segment.length = 0,       # always draw line
+      segment.color = "grey40",     # color of connecting line
+      segment.size = 0.6,           # thickness of the line
+      box.padding = 0.3,
+      point.padding = 0.25,
+      seed = 123                    # reproducible layout
+    ) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed", color = "darkred") +
+    geom_hline(yintercept = -log10(FDR_cutoff), linetype = "dashed", color = "darkred") +
+    scale_color_manual(values = direction_colours) +
+    theme_classic(base_size = 12) +
+    labs(
+      x = "log2 Fold Change",
+      y = "-log10(FDR)",
+      color = "Differential expression",
+      title = "Volcano plot"
+    )
+}
+```
+
+### 2. QC
+
+#### 2.1 Import data
+
+```{r data_import, warning = FALSE, echo=F}
+rObjectFile<-paste0(robjectsDir,"featurecounts_files.Rdata")
+
+# featureCounts writes a "# Program:.." banner, then a wide table whose LAST
+# column holds the counts and is named after the input BAM path.
+if(!file.exists(rObjectFile)){
+  inFiles<-list.files(inDir,full.names=T, pattern=".featureCounts.txt$")
+  results<-list()
+  for(inFile in inFiles){
+
+    sampleName<-basename(inFile)
+    sampleName<-gsub(".featureCounts.txt","",sampleName)
+    sampleName<-gsub("_trimmed","",sampleName)
+
+    data<-read.delim(inFile,comment.char="#")
+
+    cat(sampleName)
+    cat("\n")
+    results[[sampleName]]<-data[,ncol(data)]
+  }
+
+  df<-do.call("cbind",results)
+  df<-as.data.frame(df)
+  row.names(df)<-data$Geneid
+  save(df,file=rObjectFile)
+} else {
+  load(rObjectFile)
+}
+
+# Four libraries were resequenced in the GMP5RJ batch. Drop the superseded
+# 3SQMBY originals so each sample appears exactly once. 3SQMBY_65 was a failed
+# library (23MB vs ~870MB); the other three were rerun so that IL36b_96h is
+# internally batch-consistent.
+superseded <- c("3SQMBY_20_IL36b_96h_rep_1",
+                "3SQMBY_44_IL36b_96h_rep_2",
+                "3SQMBY_65_IL2_96h_rep_3",
+                "3SQMBY_68_IL36b_96h_rep_3")
+
+#df <- df[, !colnames(df) %in% superseded]
+
+cat("\ngenes:", nrow(df), " samples:", ncol(df), "\n")
+```
+
+#### 2.2 Sample metadata
+
+```{r design_matrix, warning = FALSE, echo=F}
+#   3SQMBY_10_IL18_48h_rep_1              (batch 1)
+#   GMP5RJ_1_rerun_IL36b_96h_rep_1_20     (batch 2, trailing number = original index)
+sample_names <- colnames(df)
+
+batch <- ifelse(grepl("^GMP5RJ", sample_names), "batch2", "batch1")
+
+core <- gsub("^3SQMBY_[0-9]+_", "", sample_names)
+core <- gsub("^GMP5RJ_[0-9]+_rerun_", "", core)
+# only the batch 2 names carry a trailing original index; stripping it from
+# batch 1 names would remove the replicate number instead
+core <- ifelse(batch == "batch2", gsub("_[0-9]+$", "", core), core)
+
+replicate <- gsub(".*_rep_", "", core)
+body      <- gsub("_rep_[0-9]+$", "", core)
+treatment <- gsub("_.*", "", body)
+# naive samples have no timepoint in the name, they are the 0h baseline
+time      <- ifelse(grepl("_", body), gsub(".*_", "", body), "0h")
+
+design_matrix <- tibble(
+  sample_name = sample_names,
+  treatment   = factor(treatment, levels = names(treatment_colours)),
+  time        = factor(time, levels = c("0h","24h","48h","72h","96h","120h")),
+  replicate   = replicate,
+  batch       = batch
+) %>%
+  mutate(
+    group = paste(treatment, time, sep = "_"),
+    label = paste(treatment, time, paste0("rep", replicate), sep = "_")
+  )
+
+row.names(design_matrix) <- design_matrix$sample_name
+
+# stop early if a filename did not parse, rather than fitting a broken model
+stopifnot(!any(is.na(design_matrix$treatment)))
+stopifnot(!any(is.na(design_matrix$time)))
+#stopifnot(!anyDuplicated(design_matrix$label))
+
+# use the readable labels from here on
+batch <- gsub("batch","b",batch)
+colnames(df) <- paste0(design_matrix$label, "_", batch)
+
+write.csv(design_matrix, paste0(tableDir,"sample_metadata.csv"), row.names = FALSE)
+
+datatable(design_matrix, options = list(pageLength = 10))
+```
+
+```{r group_sizes, warning = FALSE}
+# sanity check: every group should have three replicates
+design_matrix %>%
+  count(group, batch) %>%
+  arrange(group) %>%
+  as.data.frame()
+```
+
+#### 2.3 Annotate with gene symbols
+
+```{r annotation, warning = FALSE}
+# Same approach as the dane_rnaseq analysis: map Ensembl -> Entrez -> symbol,
+# then collapse duplicated symbols keeping the row with the larger total count.
+egENSEMBL <- toTable(org.Mm.egENSEMBL)
+ids <- gsub("\\..*","",row.names(df))
+row.names(df) <- ids
+
+m <- match(row.names(df), egENSEMBL$ensembl_id)
+df$EntrezGene <- egENSEMBL$gene_id[m]
+
+egSYMBOL <- toTable(org.Mm.egSYMBOL)
+m <- match(df$EntrezGene, egSYMBOL$gene_id)
+df$symbol <- egSYMBOL$symbol[m]
+
+#eliminate duplicated symbols, keep the one with a larger overall count
+o <- order(rowSums(df[,1:(dim(df)[2]-2)]), decreasing=TRUE)
+df <- df[o,]
+d <- duplicated(df$symbol)
+df <- df[!d,]
+df <- df[!is.na(df$symbol),]
+row.names(df) <- df$symbol
+
+counts <- df %>%
+  dplyr::select(-EntrezGene, -symbol)
+
+# keep the metadata in the same order as the count columns
+#design_matrix <- design_matrix[match(colnames(counts), design_matrix$label),]
+
+cat("genes with symbols:", nrow(counts), "\n")
+```
+
+#### 2.4 Library sizes
+
+```{r library_sizes, fig.width = 12, fig.height = 5}
+lib_df <- design_matrix %>%
+  mutate(lib_size = colSums(counts))
+
+p <- ggplot(lib_df, aes(x = label, y = lib_size/1e6, fill = treatment)) +
+  geom_col() +
+  scale_fill_manual(values = treatment_colours) +
+  labs(title = "Assigned reads per sample, after UMI deduplication",
+       x = NULL, y = "Millions of assigned reads") +
+  theme_bw(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6))
+p
+
+ggsave(paste0(imageDir,"library_sizes.pdf"), p, width = 12, height = 5)
+```
+
+#### 2.5 MDS plot
+
+```{r mds_plot, fig.width = 9, fig.height = 7}
+group <- factor(design_matrix$group)
+
+y <- DGEList(counts = counts, group = group)
+keep <- filterByExpr(y, group = group)
+y <- y[keep, , keep.lib.sizes = FALSE]
+y <- calcNormFactors(y)
+
+cat("genes retained after filterByExpr:", nrow(y), "\n")
+
+mds_result <- plotMDS(y, top = 1000, plot = FALSE)
+
+sample_df <- design_matrix %>%
+  mutate(PCA1 = mds_result$x,
+         PCA2 = mds_result$y)
+
+# colour by cytokine, shape by timepoint - one colour per group would give 24
+# colours and no readable structure
+p <- ggplot(sample_df, aes(x = PCA1, y = PCA2, color = treatment, shape = time, label = label)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(size = 2.5, max.overlaps = 30, show.legend = F) +
+  scale_color_manual(values = treatment_colours) +
+  labs(title = "MDS plot",
+       x = "Dimension 1",
+       y = "Dimension 2") +
+  theme_minimal()
+p
+
+ggsave(paste0(imageDir,"MDS_plot.pdf"), p, width = 9, height = 7)
+```
+
+```{r mds_batch, fig.width = 9, fig.height = 7}
+# the same MDS coloured by batch. If batch 2 samples sit apart from their
+# batch 1 group-mates, the IL36b_96h contrasts carry a batch effect that
+# cannot be separated from the cytokine effect.
+p <- ggplot(sample_df, aes(x = PCA1, y = PCA2, color = batch, shape = time, label = label)) +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(data = subset(sample_df, batch == "batch2"),
+                           size = 3, max.overlaps = 30, show.legend = F) +
+  scale_color_manual(values = c("batch1" = "gray70", "batch2" = "#F20D0D")) +
+  labs(title = "MDS plot, coloured by sequencing batch",
+       x = "Dimension 1", y = "Dimension 2") +
+  theme_minimal()
+p
+
+ggsave(paste0(imageDir,"MDS_plot_batch.pdf"), p, width = 9, height = 7)
+```
+
+### 3. Differential expression
+
+#### 3.1 edgeR analysis
+
+```{r edger_analysis, warnings = F, include = FALSE}
+# One model fitted across all samples, then each contrast pulled out of it.
+# The dane_rnaseq analysis subset to two groups per comparison, which is fine
+# with three groups; here there are 24, and estimating the dispersion once from
+# the whole dataset is much better informed than from six samples at a time.
+group <- factor(design_matrix$group)
+design <- model.matrix(~0+group)
+colnames(design) <- levels(group)
+
+y <- DGEList(counts = counts, group = group)
+keep <- filterByExpr(y, design)
+y <- y[keep, , keep.lib.sizes = FALSE]
+y <- calcNormFactors(y)
+y <- estimateDisp(y, design)
+fit <- glmQLFit(y, design)
+
+cytokines <- c("IL2","IL715","IL18","IL36b")
+
+# Contrasts are generated rather than typed out so they cannot drift out of
+# step with the data. NC vs naive shows the culture effect on its own.
+combinations <- list()
+
+for(tp in c("24h","48h","72h")){
+  combinations[[paste0("NC_",tp,"_vs_Naive_0h")]] <- c(paste0("NC_",tp), "Naive_0h")
+}
+
+for(cyt in cytokines){
+  # time-matched against NC, the interpretable comparisons
+  for(tp in c("24h","48h","72h")){
+    combinations[[paste0(cyt,"_",tp,"_vs_NC_",tp)]] <- c(paste0(cyt,"_",tp), paste0("NC_",tp))
+  }
+  # no NC exists at these timepoints, so naive is the only available reference
+  for(tp in c("96h","120h")){
+    combinations[[paste0(cyt,"_",tp,"_vs_Naive_0h")]] <- c(paste0(cyt,"_",tp), "Naive_0h")
+  }
+}
+
+# drop any contrast whose groups are not both present
+combinations <- combinations[sapply(combinations, function(x) all(x %in% colnames(design)))]
+
+top_tables <- list()
+for(combination in names(combinations)){
+
+  treatment1 <- combinations[[combination]][1]
+  treatment2 <- combinations[[combination]][2]
+
+  cat(combination)
+  cat("\n")
+
+  myargs = list(paste0(treatment1,"-",treatment2), levels=design)
+  contrasts <- do.call(makeContrasts, myargs)
+  qlf <- glmQLFTest(fit, contrast = contrasts)
+  top.table <- topTags(qlf, n = Inf)
+  top.table <- as.data.frame(top.table) %>%
+    tibble::rownames_to_column("gene")
+  write.csv(top.table,paste0(tableDir,combination,".csv"),quote=F,row.names=F)
+
+  expression<-as.data.frame(top.table)
+  row.names(expression) <- expression$gene
+  top_tables[[combination]] <- expression
+}
+```
+
+#### 3.2 Number of DE genes per comparison
+
+```{r de_summary, fig.width = 12, fig.height = 6}
+de_summary <- imap_dfr(top_tables, function(tbl, comp_name){
+  tbl %>%
+    mutate(direction = case_when(
+      FDR < 0.05 & logFC >= 1  ~ "up",
+      FDR < 0.05 & logFC <= -1 ~ "down",
+      TRUE ~ "ns")) %>%
+    filter(direction != "ns") %>%
+    count(direction, name = "n_genes") %>%
+    mutate(comparison = comp_name)
+})
+
+de_summary <- de_summary %>%
+  mutate(comparison = factor(comparison, levels = names(combinations))) %>%
+  complete(comparison, direction = c("down","up"), fill = list(n_genes = 0)) %>%
+  mutate(signed_n = ifelse(direction == "down", -n_genes, n_genes))
+
+p <- ggplot(de_summary, aes(x = comparison, y = signed_n, fill = direction)) +
+  geom_col(width = 0.75, colour = "black") +
+  geom_hline(yintercept = 0, colour = "black") +
+  scale_fill_manual(values = c("down" = "#0096FF", "up" = "#F20D0D")) +
+  labs(title = "Differentially expressed genes by comparison",
+       subtitle = "FDR < 0.05, |log2FC| >= 1",
+       x = "Comparison", y = "Number of DE genes") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+p
+
+ggsave(paste0(imageDir,"DE_gene_counts.pdf"), p, width = 12, height = 6)
+```
+
+#### 3.3 Volcano plots
+
+```{r volcanoes, fig.width = 8, fig.height = 5, results = "asis"}
+# T-cell differentiation markers, same list used in the dane_rnaseq volcanoes
+marker_genes <- c("Batf","Nr4a1","Id3","Id2","Gzmb","Tnf","Ifng","Tcf7","Sell","Ccr7",
+                  "Slamf6","Bcl2","Bach2","Tbx21","Prdm1","Il2ra","Il2rb",
+                  "Cxcr3","Cxcr6","Pdcd1","Ctla4","Foxo1","Myb","Klrg1")
+
+# looped because the contrast list is generated, so its length can change
+for(comparison in names(top_tables)){
+  cat("\n\n##### ", comparison, "\n\n", sep="")
+  p <- plot_volcano(top_tables[[comparison]],
+                    max.overlaps = 10000,
+                    highlight_genes = marker_genes) +
+    ggtitle(comparison)
+  print(p)
+  cat("\n\n")
+}
+```
+
+#### 3.4 Combined DE table
+
+```{r total_DE_tables, echo=FALSE}
+table_df <- imap_dfr(top_tables, function(tbl, comp_name){
+  tbl %>%
+    filter(FDR < 0.05) %>%
+    dplyr::select(gene, logFC, FDR) %>%
+    mutate(treatment = comp_name)
+})
+
+table_df_pivot <- table_df %>%
+  pivot_wider(
+    id_cols = gene,
+    names_from = treatment,
+    values_from = c(logFC, FDR),
+    names_glue = "{treatment}_{.value}",
+    values_fn = dplyr::first
+  ) %>%
+  rename_with(~ gsub("logFC", "log2FC", .), everything()) %>%
+  mutate(across(contains("log2FC"), ~ round(.x, 3))) %>%
+  mutate(across(contains("FDR"), ~ signif(.x, 3)))
+
+table_df_pivot <- table_df_pivot[, c("gene", sort(colnames(table_df_pivot)[-1]))]
+
+datatable(table_df_pivot,
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 10,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ))
+```
+
+#### 3.5 Plotting individual genes
+
+```{r plot_counts, fig.width = 10, fig.height = 8, warning=FALSE}
+#Select genes to plot
+genes_to_plot <- c("Nr4a1", "Id3", "Gzmb", "Tnf", "Ifng", "Tcf7")
+
+dge <- DGEList(counts = counts, group = design_matrix$group)
+dge <- calcNormFactors(dge, method = "TMM")
+count_matrix <- cpm(dge, log = FALSE)
+
+# long format, one row per gene x sample, with treatment and time attached
+dt_long <- as.data.frame(count_matrix) %>%
+  tibble::rownames_to_column("Genes") %>%
+  filter(Genes %in% genes_to_plot) %>%
+  pivot_longer(-Genes, names_to = "label", values_to = "Expression") %>%
+  left_join(design_matrix, by = "label")
+
+# one panel per gene, x axis is the timecourse, one line per cytokine
+p <- ggplot(dt_long, aes(x = time, y = Expression, fill = treatment)) +
+  geom_boxplot(outlier.size = 0.5) +
+  facet_wrap(~Genes, ncol = 3, scales = "free_y") +
+  scale_fill_manual(values = treatment_colours) +
+  scale_x_discrete(guide = guide_axis(angle = 90)) +
+  labs(y = "Gene Expression (CPM)", x = NULL) +
+  theme_bw() +
+  ylim(c(0,NA))
+p
+
+ggsave(paste0(imageDir,"marker_genes.pdf"), p, width = 10, height = 8)
+```
+
+### 4. Pathway analysis
+
+#### 4.1 Hallmark enrichment
+
+```{r pathway_analysis, fig.width = 10, fig.height = 12, warning=FALSE}
+#get the hallmarks database
+h_gene_sets = msigdbr(species = "mouse", category = "H")
+local_gene_sets_df <- h_gene_sets %>%
+  dplyr::select(gs_name, gene_symbol)
+
+# run enrichment separately on the up and down gene lists of each contrast,
+# returning NULL when a list is too short to test
+run_enrichment <- function(genes, direction_label, treatment_label, min_size = 5){
+  genes <- unique(na.omit(genes))
+  if(length(genes) < min_size) return(NULL)
+
+  enr <- clusterProfiler::enricher(gene = genes,
+                                   TERM2GENE = local_gene_sets_df,
+                                   pAdjustMethod = "BH")
+  if(is.null(enr)) return(NULL)
+  res <- as.data.frame(enr)
+  if(nrow(res) == 0) return(NULL)
+
+  res %>%
+    mutate(direction = direction_label, treatment = treatment_label)
+}
+
+results <- list()
+for(combination in names(top_tables)){
+  tbl <- top_tables[[combination]]
+  up   <- tbl %>% filter(FDR < 0.05, logFC >= 1)  %>% pull(gene)
+  down <- tbl %>% filter(FDR < 0.05, logFC <= -1) %>% pull(gene)
+
+  results[[paste0(combination,"_up")]]   <- run_enrichment(up,   "Upregulated",   combination)
+  results[[paste0(combination,"_down")]] <- run_enrichment(down, "Downregulated", combination)
+}
+
+# Combine all enrichment results into one dataframe
+collated <- bind_rows(results) %>%
+  mutate(pathway = gsub("HALLMARK_", "", ID)) %>%
+  mutate(
+    treatment = forcats::fct_relevel(treatment, names(combinations)),
+    pathway = fct_rev(fct_relevel(pathway, sort(unique(pathway))))
+  ) %>%
+  filter(p.adjust < 0.05)
+
+write.csv(collated, paste0(tableDir,"hallmark_enrichment.csv"), row.names = FALSE)
+
+p <- collated %>%
+  ggplot(aes(treatment, pathway, size = FoldEnrichment)) +
+  geom_point(aes(color = direction)) +
+  facet_wrap(~direction, nrow = 1) +
+  scale_color_manual(values = c(
+    "Upregulated" = "firebrick",
+    "Downregulated" = "steelblue"
+  )) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    strip.text = element_text(size = 8, face = "bold"),
+    legend.position = "right"
+  ) +
+  labs(
+    title = "Pathway Enrichment across Treatments",
+    x = "Treatment",
+    y = "Pathway"
+  )
+p
+
+ggsave(paste0(imageDir,"hallmark_enrichment.pdf"), p, width = 10, height = 12)
+```
+
+#### 4.2 Enrichment table
+
+```{r pathway_table, echo=FALSE}
+datatable(
+  collated %>%
+    dplyr::select(treatment, direction, pathway, GeneRatio, BgRatio, p.adjust, Count) %>%
+    mutate(p.adjust = signif(p.adjust, 3)) %>%
+    arrange(p.adjust),
+  extensions = 'Buttons',
+  options = list(
+    pageLength = 15,
+    scrollX = TRUE,
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel')
+  ))
+```
+
+### 5. Session info
+
+```{r session_info}
+sessionInfo()
+```
